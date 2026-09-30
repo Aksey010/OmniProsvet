@@ -66,6 +66,9 @@ def run_extract(
             if progress:
                 progress({"log": f"Ошибка транскрибации {f.name}: {exc}"})
     return results
+
+
+def run_extract_and_process(
     media_files: list[tuple[Path, Path]],
     model: str,
     language: str,

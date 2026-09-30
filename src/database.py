@@ -96,6 +96,12 @@ def list_jobs(limit: int = 50) -> list[dict]:
 
     conn = sqlite3.connect(str(get_conn()))
     try:
+        # Check if jobs table exists
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='jobs'"
+        )
+        if not cursor.fetchone():
+            return []
         rows = conn.execute(
             "SELECT id, data, created_at FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
@@ -112,6 +118,7 @@ def list_jobs(limit: int = 50) -> list[dict]:
             "language": data.get("language", ""),
             "created_at": time.strftime("%d.%m.%Y %H:%M", time.localtime(row[2])),
         })
+    return jobs
     return jobs
 
 

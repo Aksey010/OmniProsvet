@@ -11,15 +11,18 @@ from loguru import logger
 from src.collect import TRANSCRIPTS_DIR
 from src.configuration import settings
 from src.database import init_db, get_job, save_job, delete_old_jobs
-from src.pipeline import run_pipeline, OUTPUT_DIR
+from src.pipeline import run_pipeline
 
 BASE_DIR = Path(__file__).parent
 UPLOADS_DIR = BASE_DIR / "uploads"
 RESULTS_DIR = BASE_DIR / "results"
+OUTPUT_DIR = settings.output_dir
 UPLOADS_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
 
 logger.add(BASE_DIR / "omniprosvet.log", rotation="1 week", encoding="utf-8")
+
+init_db()
 
 ACCEPT = (
     ".wav,.mp3,.m4a,.flac,.ogg,.opus,.wma,.aac,"
@@ -214,7 +217,11 @@ def download():
 @app.get("/api/jobs")
 def list_jobs():
     from src.database import list_jobs as db_list_jobs
-    jobs = db_list_jobs(limit=50)
+    try:
+        jobs = db_list_jobs(limit=50)
+    except Exception as e:
+        logger.warning(f"Ошибка получения списка задач: {e}")
+        jobs = []
     return jsonify(jobs=jobs)
 
 
