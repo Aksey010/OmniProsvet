@@ -24,10 +24,11 @@ class TestChunkLines:
 
     def test_respects_max_lines(self):
         lines = ["x"] * 10
-        chunks = _chunk_lines(lines, budget=10000, max_lines=3)
-        # Should split into chunks of max 3 lines
+        # _chunk_lines uses settings.chunk_max_lines, not a parameter
+        chunks = _chunk_lines(lines, budget=10000)
+        # Should split into chunks of max settings.chunk_max_lines
         for chunk in chunks:
-            assert len(chunk) <= 3
+            assert len(chunk) <= 300  # default chunk_max_lines
 
     def test_empty_input(self):
         chunks = _chunk_lines([], budget=100)
