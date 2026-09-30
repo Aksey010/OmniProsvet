@@ -5,7 +5,7 @@ from loguru import logger
 
 from src.configuration import settings
 from src.database import init_db
-from src.processor import run_pipeline
+from src.pipeline import run_pipeline
 
 
 def main() -> None:
@@ -15,7 +15,7 @@ def main() -> None:
     parser.add_argument(
         "command",
         choices=["extract", "process", "all"],
-        help="extract — транскрибация; process — DeepSeek по транскриптам и картинкам; all — всё",
+        help="extract — транскрибация; process — NIM по транскриптам и картинкам; all — всё",
     )
     parser.add_argument("paths", nargs="+", help="Файл или папка с материалами")
     parser.add_argument(
@@ -29,6 +29,13 @@ def main() -> None:
 
     logger.add("omniprosvet.log", rotation="1 week", encoding="utf-8")
     init_db()
+
+    # Валидация настроек
+    errors = settings.validate()
+    if errors:
+        for err in errors:
+            logger.error(f"Ошибка конфигурации: {err}")
+        return
 
     def progress(event: dict) -> None:
         if "log" in event:

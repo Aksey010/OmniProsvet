@@ -5,12 +5,13 @@ import webbrowser
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request, send_file
+from flask_socketio import SocketIO, emit
 from loguru import logger
 
 from src.collect import TRANSCRIPTS_DIR
 from src.configuration import settings
-from src.database import init_db
-from src.processor import OUTPUT_DIR, run_pipeline
+from src.database import init_db, get_job, save_job, delete_old_jobs
+from src.pipeline import run_pipeline, OUTPUT_DIR
 
 BASE_DIR = Path(__file__).parent
 UPLOADS_DIR = BASE_DIR / "uploads"
@@ -32,8 +33,10 @@ LANGUAGES = {"auto", "zh", "ru", "en", "ja", "ko", "de", "fr", "es"}
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
-jobs = {}
+# Очистка старых задач при запуске
+delete_old_jobs(days=7)
 
 
 class _PhaseProgress:
@@ -60,13 +63,17 @@ class _PhaseProgress:
         return min(100, round(self.completed + frac * weight))
 
 
-def run_job(job_id: str, paths: list[str], mode: str, diarize: bool, model: str, language: str, platform: str) -> None:
-    job = jobs[job_id]
+def run_job(job_id: str, paths: list[str], mode: str, diarize: bool, model: str, language: str) -> None:
+    job = get_job(job_id)
+    if not job:
+        return
     pp = _PhaseProgress()
 
     def progress(event: dict) -> None:
         if "log" in event:
             job["lines"].append(event["log"])
+            socketio.emit("job_log", {"job_id": job_id, "log": event["log"]})
+            save_job(job_id, job)
             return
         pp.feed(event)
         job["progress"] = pp.percent()
@@ -76,12 +83,18 @@ def run_job(job_id: str, paths: list[str], mode: str, diarize: bool, model: str,
                 job["file_index"] = event["file_index"]
             if event.get("file_total"):
                 job["file_total"] = event["file_total"]
+        socketio.emit("job_progress", {"job_id": job_id, **job})
+        save_job(job_id, job)
 
     try:
         init_db()
         job["state"] = "working"
+        job["progress"] = 0
+        save_job(job_id, job)
+        socketio.emit("job_status", {"job_id": job_id, "state": "working"})
+
         result = run_pipeline(
-            paths,
+            [Path(p) for p in paths],
             model=model,
             language=language,
             diarize=diarize,
@@ -90,7 +103,6 @@ def run_job(job_id: str, paths: list[str], mode: str, diarize: bool, model: str,
             images=(mode == "full"),
             out_dir=OUTPUT_DIR,
             progress=progress,
-            platform=platform,
         )
         job["state"] = "done"
         job["progress"] = 100
@@ -100,10 +112,14 @@ def run_job(job_id: str, paths: list[str], mode: str, diarize: bool, model: str,
             f"Готово. Транскриптов: {len(result['transcripts'])}, "
             f"отчётов по картинкам: {len(result['image_reports'])}"
         )
+        save_job(job_id, job)
+        socketio.emit("job_done", {"job_id": job_id, **job})
     except Exception as e:
         job["state"] = "error"
         job["error"] = str(e)
+        save_job(job_id, job)
         logger.exception(f"Задача {job_id} упала с ошибкой")
+        socketio.emit("job_error", {"job_id": job_id, "error": str(e)})
 
 
 @app.post("/api/start")
@@ -131,9 +147,6 @@ def start():
     mode = request.form.get("mode", "full")
     if mode not in ("full", "extract"):
         mode = "full"
-    platform = request.form.get("platform", settings.analysis_platform)
-    if platform not in ("deepseek", "nim"):
-        platform = settings.analysis_platform
     diarize = request.form.get("diarize", "1") == "1"
     model = request.form.get("model", settings.whisper_model)
     if model not in MODEL_SIZES:
@@ -143,19 +156,22 @@ def start():
         language = settings.language
 
     job_id = uuid.uuid4().hex
-    jobs[job_id] = {
+    job_data = {
         "state": "queued", "progress": 0, "lines": [], "current": "",
         "file_index": 0, "file_total": 0, "error": "", "report": None,
+        "mode": model, "language": language, "diarize": diarize,
     }
+    save_job(job_id, job_data)
+
     threading.Thread(
-        target=run_job, args=(job_id, paths, mode, diarize, model, language, platform), daemon=True
+        target=run_job, args=(job_id, paths, mode, diarize, model, language), daemon=True
     ).start()
     return jsonify(job_id=job_id)
 
 
 @app.get("/api/status/<job_id>")
 def status(job_id):
-    job = jobs.get(job_id)
+    job = get_job(job_id)
     if not job:
         return jsonify(error="Задача не найдена"), 404
     return jsonify(**job)
@@ -163,6 +179,9 @@ def status(job_id):
 
 @app.get("/api/files/<job_id>")
 def files_list(job_id):
+    job = get_job(job_id)
+    if not job:
+        return jsonify(error="Задача не найдена"), 404
     out = []
     for d in (UPLOADS_DIR / job_id, OUTPUT_DIR, TRANSCRIPTS_DIR, RESULTS_DIR):
         if not d.exists():
@@ -174,7 +193,7 @@ def files_list(job_id):
 
 @app.get("/api/result/<job_id>")
 def result(job_id):
-    job = jobs.get(job_id)
+    job = get_job(job_id)
     if not job or not job.get("report"):
         return "Not ready", 404
     return send_file(job["report"], as_attachment=True)
@@ -190,6 +209,25 @@ def download():
     if not p.exists() or not p.is_file():
         return "Not found", 404
     return send_file(p, as_attachment=True)
+
+
+@app.get("/api/jobs")
+def list_jobs():
+    from src.database import list_jobs as db_list_jobs
+    jobs = db_list_jobs(limit=50)
+    return jsonify(jobs=jobs)
+
+
+@app.delete("/api/jobs/<job_id>")
+def delete_job(job_id):
+    from src.database import delete_job as db_delete_job
+    db_delete_job(job_id)
+    # Clean up upload directory
+    upload_dir = UPLOADS_DIR / job_id
+    if upload_dir.exists():
+        import shutil
+        shutil.rmtree(upload_dir, ignore_errors=True)
+    return jsonify(ok=True)
 
 
 PAGE = """<!DOCTYPE html>
@@ -229,6 +267,15 @@ PAGE = """<!DOCTYPE html>
   .chk { font-size: 14px; color: #333; margin-top: 12px; display: flex; align-items: center; gap: 8px; }
   .hint { font-size: 12px; color: #777; margin-top: 8px; }
   a.dl { display: inline-block; margin-top: 8px; margin-right: 14px; color: #1565c0; font-size: 14px; }
+  .job-item { padding: 10px; border-bottom: 1px solid #eee; cursor: pointer; }
+  .job-item:hover { background: #f5f5f5; }
+  .job-item:last-child { border-bottom: none; }
+  .job-meta { font-size: 12px; color: #777; }
+  .job-status { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
+  .status-queued { background: #e3f2fd; color: #1565c0; }
+  .status-working { background: #fff3e0; color: #e65100; }
+  .status-done { background: #e8f5e9; color: #2e7d32; }
+  .status-error { background: #ffebee; color: #c62828; }
 </style>
 </head>
 <body>
@@ -246,12 +293,6 @@ PAGE = """<!DOCTYPE html>
       <button type="button" class="srcbtn active" id="btnFull">Полная обработка (транскрибация + анализ)</button>
       <button type="button" class="srcbtn" id="btnExtract">Только транскрибация</button>
     </div>
-    <label>Платформа анализа</label>
-    <div>
-      <button type="button" class="srcbtn active" id="btnDeepseek">DeepSeek (браузер)</button>
-      <button type="button" class="srcbtn" id="btnNim">NVIDIA NIM API</button>
-    </div>
-    <div class="hint" id="platformHint">Анализ через веб-чат DeepSeek: при запуске откроется окно браузера для входа</div>
     <label>Модель whisper</label>
     <select id="model">
       <option value="tiny">tiny — очень быстро, грубо</option>
@@ -275,7 +316,11 @@ PAGE = """<!DOCTYPE html>
     <div class="chk"><input type="checkbox" id="diarize" checked> Диаризация спикеров (polyvoice, модели качаются автоматически)</div>
     <br>
     <button id="go">Начать</button>
-    <button type="button" class="srcbtn" id="btnLogout">Сменить аккаунт DeepSeek</button>
+  </div>
+
+  <div class="card">
+    <label>История задач</label>
+    <div id="jobList"></div>
   </div>
 
   <div class="card hidden" id="progress_card">
@@ -285,9 +330,11 @@ PAGE = """<!DOCTYPE html>
     <div id="downloads"></div>
   </div>
 </div>
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
-let jobId = null, timer = null, mode = "full", platform = "__PLATFORM__";
+let jobId = null, socket = null;
+let mode = "full";
 
 const drop = $("drop"), fileInput = $("file");
 drop.onclick = () => fileInput.click();
@@ -302,29 +349,6 @@ function showFiles() {
 
 $("btnFull").onclick = () => setMode("full");
 $("btnExtract").onclick = () => setMode("extract");
-
-$("btnDeepseek").onclick = () => setPlatform("deepseek");
-$("btnNim").onclick = () => setPlatform("nim");
-function setPlatform(p) {
-  platform = p;
-  $("btnDeepseek").classList.toggle("active", p === "deepseek");
-  $("btnNim").classList.toggle("active", p === "nim");
-  const hint = $("platformHint");
-  if (p === "nim") {
-    hint.textContent = "Анализ через NVIDIA NIM API (ключ NIM_API_KEY в .env): браузер не нужен, параллельные запросы";
-    $("btnLogout").style.display = "none";
-  } else {
-    hint.textContent = "Анализ через веб-чат DeepSeek: при запуске откроется окно браузера для входа";
-    $("btnLogout").style.display = "";
-  }
-}
-setPlatform(platform);
-
-$("btnLogout").onclick = async () => {
-  if (!confirm("Сбросить профиль браузера и выйти из аккаунта DeepSeek?")) return;
-  await fetch("/api/logout", { method: "POST" });
-  alert("Профиль сброшен — откроется окно входа DeepSeek");
-};
 function setMode(m) {
   mode = m;
   $("btnFull").classList.toggle("active", m === "full");
@@ -336,7 +360,6 @@ $("go").onclick = async () => {
   for (const f of fileInput.files) fd.append("files", f);
   fd.append("path", $("path").value);
   fd.append("mode", mode);
-  fd.append("platform", platform);
   fd.append("model", $("model").value);
   fd.append("language", $("language").value);
   fd.append("diarize", $("diarize").checked ? "1" : "0");
@@ -347,30 +370,43 @@ $("go").onclick = async () => {
   $("progress_card").classList.remove("hidden");
   $("downloads").innerHTML = "";
   $("go").disabled = true;
-  timer = setInterval(poll, 1000);
+  connectSocket();
 };
 
-async function poll() {
-  const r = await fetch("/api/status/" + jobId);
-  if (!r.ok) {
-    clearInterval(timer); timer = null;
+function connectSocket() {
+  if (socket) { socket.disconnect(); }
+  socket = io();
+  socket.on("connect", () => {
+    console.log("WebSocket connected");
+    socket.emit("join_job", {job_id: jobId});
+  });
+  socket.on("job_progress", (data) => {
+    if (data.job_id !== jobId) return;
+    $("fill").style.width = (data.progress || 0) + "%";
+    if (data.state === "queued") $("status").textContent = "В очереди…";
+    if (data.state === "working")
+      $("status").textContent = (data.file_total > 1 ? "Файл " + data.file_index + " из " + data.file_total + ": " : "") + (data.current || "работаю…");
+    if (data.error) $("status").innerHTML = '<span class="err">Ошибка: ' + data.error + "</span>";
+    if (data.lines && data.lines.length) { $("log").textContent = data.lines.join("\\n"); $("log").scrollTop = 1e9; }
+  });
+  socket.on("job_log", (data) => {
+    if (data.job_id !== jobId) return;
+    if (data.log) { $("log").textContent += "\\n" + data.log; $("log").scrollTop = 1e9; }
+  });
+  socket.on("job_done", (data) => {
+    if (data.job_id !== jobId) return;
     $("go").disabled = false;
-    $("status").innerHTML = '<span class="err">Задача не найдена — перезагрузите страницу</span>';
-    return;
-  }
-  const j = await r.json();
-  $("fill").style.width = (j.progress || 0) + "%";
-  if (j.state === "queued") $("status").textContent = "В очереди…";
-  if (j.state === "working")
-    $("status").textContent = (j.file_total > 1 ? "Файл " + j.file_index + " из " + j.file_total + ": " : "") + (j.current || "работаю…");
-  if (j.error) $("status").innerHTML = '<span class="err">Ошибка: ' + j.error + "</span>";
-  if (j.lines && j.lines.length) { $("log").textContent = j.lines.join("\\n"); $("log").scrollTop = 1e9; }
-  if (j.state === "done" || j.state === "error") {
-    clearInterval(timer);
-    $("go").disabled = false;
-    if (j.state === "done") $("status").textContent = "Готово ✔";
+    $("status").textContent = "Готово ✔";
     loadFiles();
-  }
+  });
+  socket.on("job_error", (data) => {
+    if (data.job_id !== jobId) return;
+    $("go").disabled = false;
+    $("status").innerHTML = '<span class="err">Ошибка: ' + data.error + "</span>";
+  });
+  socket.on("disconnect", () => {
+    console.log("WebSocket disconnected");
+  });
 }
 
 async function loadFiles() {
@@ -381,9 +417,39 @@ async function loadFiles() {
     '<a class="dl" href="/api/download?path=' + encodeURIComponent(f.path) + '">⬇ ' + f.name + "</a>");
   if (parts.length) $("downloads").innerHTML = parts.join("<br>");
 }
+
+async function loadJobList() {
+  const r = await fetch("/api/jobs");
+  if (!r.ok) return;
+  const j = await r.json();
+  const html = j.jobs.map(job => `
+    <div class="job-item" onclick="showJob('${job.id}')">
+      <div><strong>${job.id.slice(0,8)}</strong> <span class="job-status status-${job.state}">${job.state}</span></div>
+      <div class="job-meta">${job.created_at} • ${job.mode || 'N/A'} • ${job.progress || 0}%</div>
+    </div>
+  `).join("");
+  $("jobList").innerHTML = html || '<div class="job-meta">Нет задач</div>';
+}
+
+function showJob(id) {
+  jobId = id;
+  $("progress_card").classList.remove("hidden");
+  $("downloads").innerHTML = "";
+  $("go").disabled = true;
+  connectSocket();
+  // Load existing progress
+  fetch("/api/status/" + id).then(r => r.json()).then(job => {
+    if (job.progress !== undefined) $("fill").style.width = job.progress + "%";
+    if (job.lines && job.lines.length) { $("log").textContent = job.lines.join("\\n"); $("log").scrollTop = 1e9; }
+    if (job.state === "done") loadFiles();
+  });
+}
+
+loadJobList();
+setInterval(loadJobList, 30000);
 </script>
 </body>
-</html>""".replace("__ACCEPT__", ACCEPT).replace("__PLATFORM__", settings.analysis_platform)
+</html>""".replace("__ACCEPT__", ACCEPT)
 
 
 @app.get("/")
@@ -394,32 +460,12 @@ def index():
     return resp
 
 
-@app.post("/api/logout")
-def logout():
-    from src.deepseek_agent import agent
-
-    agent.reset_profile()
-    threading.Thread(target=_warmup_deepseek, daemon=True, name="deepseek-warmup").start()
-    return jsonify(ok=True)
-
-
-def _warmup_deepseek() -> None:
-    if settings.analysis_platform == "nim":
-        logger.info("Платформа анализа: NVIDIA NIM API — браузер для DeepSeek не запускается")
-        return
-    try:
-        from src.deepseek_agent import agent
-
-        with agent.lock:
-            driver = agent._ensure_driver()
-            agent._ensure_logged_in(driver, settings.deepseek_login, settings.deepseek_password)
-        logger.info("DeepSeek: браузер открыт, вход выполнен — можно запускать обработку")
-    except Exception as exc:
-        logger.warning(f"Прогрев DeepSeek не удался: {exc} — вход будет запрошен при обработке")
+@socketio.on("join_job")
+def on_join_job(data):
+    pass  # Client joins room for this job
 
 
 if __name__ == "__main__":
     url = "http://127.0.0.1:5000"
     threading.Timer(1.5, lambda: webbrowser.open(url)).start()
-    threading.Thread(target=_warmup_deepseek, daemon=True, name="deepseek-warmup").start()
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    socketio.run(app, host="127.0.0.1", port=5000, debug=False)

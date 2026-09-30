@@ -152,8 +152,6 @@ class NimClient:
     def send_prompt(
         self,
         prompt: str,
-        login: str = "",
-        password: str = "",
         deepthink: bool = True,
         expert: bool = True,
         attachments: list[str] | None = None,

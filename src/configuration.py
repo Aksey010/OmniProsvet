@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -10,51 +11,76 @@ def _as_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default) == "1"
 
 
+def _as_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    return int(val) if val is not None else default
+
+
+def _as_float(name: str, default: float) -> float:
+    val = os.getenv(name)
+    return float(val) if val is not None else default
+
+
 @dataclass(frozen=True)
 class Settings:
-    # DeepSeek (веб-чат через Selenium)
-    deepseek_login: str = os.getenv("DEEPSEEK_LOGIN", "")
-    deepseek_password: str = os.getenv("DEEPSEEK_PASSWORD", "")
-    deepseek_deepthink: bool = _as_bool("DEEPSEEK_DEEPTHINK", "1")
-    deepseek_expert: bool = _as_bool("DEEPSEEK_EXPERT", "1")
-    deepseek_workers: int = int(os.getenv("DEEPSEEK_WORKERS", "1") or "1")
-    deepseek_headless: bool = _as_bool("DEEPSEEK_HEADLESS", "0")
-    deepseek_hidden_window: bool = _as_bool("DEEPSEEK_HIDDEN_WINDOW", "0")
-    deepseek_pause_min: int = int(os.getenv("DEEPSEEK_PAUSE_MIN", "15") or "15")
-    deepseek_pause_max: int = int(os.getenv("DEEPSEEK_PAUSE_MAX", "60") or "60")
-
     # Whisper
     whisper_model: str = os.getenv("WHISPER_MODEL", "small")
     language: str = os.getenv("LANGUAGE", "auto")
     whisper_fast: bool = _as_bool("WHISPER_FAST", "1")
-    whisper_batch_size: int = int(os.getenv("WHISPER_BATCH_SIZE", "8") or "8")
+    whisper_batch_size: int = _as_int("WHISPER_BATCH_SIZE", 8)
 
     # Диаризация (polyvoice)
     diarization: bool = _as_bool("DIARIZATION", "1")
     polyvoice_variant: str = os.getenv("POLYVOICE_VARIANT", "balanced")
 
     # Обработка
-    chunk_char_budget: int = int(os.getenv("CHUNK_CHAR_BUDGET", "65000") or "65000")
-    chunk_max_lines: int = int(os.getenv("CHUNK_MAX_LINES", "300") or "300")
-    images_per_batch: int = int(os.getenv("IMAGES_PER_BATCH", "25") or "25")
-    pdf_max_size_mb: int = int(os.getenv("PDF_MAX_SIZE_MB", "40") or "40")
-
-    # Платформа анализа: deepseek (браузер) или nim (NVIDIA NIM API)
-    analysis_platform: str = os.getenv("ANALYSIS_PLATFORM", "deepseek")
+    chunk_char_budget: int = _as_int("CHUNK_CHAR_BUDGET", 65000)
+    chunk_max_lines: int = _as_int("CHUNK_MAX_LINES", 300)
+    images_per_batch: int = _as_int("IMAGES_PER_BATCH", 25)
+    pdf_max_size_mb: int = _as_int("PDF_MAX_SIZE_MB", 40)
 
     # NVIDIA NIM API (бесплатный ключ с build.nvidia.com)
     nim_api_key: str = os.getenv("NIM_API_KEY", "")
-    nim_model: str = os.getenv("NIM_MODEL", "openai/gpt-oss-20b")
-    nim_reduce_model: str = os.getenv("NIM_REDUCE_MODEL", "openai/gpt-oss-20b")
+    nim_model: str = os.getenv("NIM_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
+    nim_reduce_model: str = os.getenv("NIM_REDUCE_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
     nim_vision_model: str = os.getenv("NIM_VISION_MODEL", "meta/llama-3.2-90b-vision-instruct")
-    nim_rpm: int = int(os.getenv("NIM_RPM", "40") or "40")
-    nim_max_tokens: int = int(os.getenv("NIM_MAX_TOKENS", "16384") or "16384")
-    nim_temperature: float = float(os.getenv("NIM_TEMPERATURE", "0.7") or "0.7")
-    nim_frequency_penalty: float = float(os.getenv("NIM_FREQUENCY_PENALTY", "0.4") or "0.4")
-    nim_presence_penalty: float = float(os.getenv("NIM_PRESENCE_PENALTY", "0.3") or "0.3")
-    nim_workers: int = int(os.getenv("NIM_WORKERS", "8") or "8")
-    nim_images_per_batch: int = int(os.getenv("NIM_IMAGES_PER_BATCH", "5") or "5")
-    nim_chunk_char_budget: int = int(os.getenv("NIM_CHUNK_CHAR_BUDGET", "12000") or "12000")
+    nim_rpm: int = _as_int("NIM_RPM", 40)
+    nim_max_tokens: int = _as_int("NIM_MAX_TOKENS", 16384)
+    nim_temperature: float = _as_float("NIM_TEMPERATURE", 0.7)
+    nim_frequency_penalty: float = _as_float("NIM_FREQUENCY_PENALTY", 0.4)
+    nim_presence_penalty: float = _as_float("NIM_PRESENCE_PENALTY", 0.3)
+    nim_workers: int = _as_int("NIM_WORKERS", 8)
+    nim_images_per_batch: int = _as_int("NIM_IMAGES_PER_BATCH", 5)
+    nim_chunk_char_budget: int = _as_int("NIM_CHUNK_CHAR_BUDGET", 12000)
+
+    # Пути
+    base_dir: Path = Path(__file__).resolve().parent.parent
+    data_dir: Path = base_dir / "data"
+    output_dir: Path = base_dir / "output"
+    transcripts_dir: Path = base_dir / "transcripts"
+    results_dir: Path = base_dir / "results"
+    tmp_pdfs_dir: Path = base_dir / "tmp_pdfs"
+    browser_profile_dir: Path = data_dir / "browser-profile"
+    cache_db_path: Path = data_dir / "cache.db"
+
+    def validate(self) -> list[str]:
+        """Валидация настроек. Возвращает список ошибок."""
+        errors = []
+        if not self.nim_api_key:
+            errors.append("NIM_API_KEY не задан в .env — получите бесплатный ключ на https://build.nvidia.com")
+        if self.nim_rpm <= 0:
+            errors.append("NIM_RPM должен быть > 0")
+        if self.nim_max_tokens <= 0:
+            errors.append("NIM_MAX_TOKENS должен быть > 0")
+        if not 0 <= self.nim_temperature <= 2:
+            errors.append("NIM_TEMPERATURE должен быть в диапазоне 0-2")
+        if self.nim_workers <= 0:
+            errors.append("NIM_WORKERS должен быть > 0")
+        return errors
 
 
 settings = Settings()
+
+# Создаём необходимые директории при импорте
+for d in (settings.data_dir, settings.output_dir, settings.transcripts_dir, settings.results_dir, settings.tmp_pdfs_dir):
+    d.mkdir(parents=True, exist_ok=True)
