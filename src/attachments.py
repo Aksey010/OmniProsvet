@@ -1,5 +1,6 @@
 import hashlib
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from loguru import logger
@@ -10,6 +11,39 @@ from src.database import get_cached_fragment, save_fragment_cache
 from src.nim_client import NimError, client as nim_client
 from src.prompts import build_documents_prompt, build_images_prompt
 from src.utils import _chunk_lines, _footer_block, _header_block
+from src.analysis import _FragProgress, _process_fragment, _submit_fragments
+
+try:
+    from pdf2image import convert_from_path
+    PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    PDF2IMAGE_AVAILABLE = False
+    logger.warning("pdf2image не установлен — fallback для сканированных PDF недоступен")
+
+
+def _pdf_to_images(pdf: Path, dpi: int = 200) -> list[Path]:
+    """Конвертирует страницы PDF в изображения (PNG)."""
+    if not PDF2IMAGE_AVAILABLE:
+        raise RuntimeError("pdf2image не установлен")
+    
+    # Конвертируем в временную папку
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        images = convert_from_path(
+            str(pdf),
+            dpi=dpi,
+            output_folder=tmpdir,
+            fmt="png",
+            paths_only=True,
+        )
+        # Копируем в постоянное место (tmpdir удалится после выхода)
+        saved = []
+        for img_path in images:
+            src = Path(img_path)
+            dst = settings.tmp_pdfs_dir / f"{pdf.stem}_{src.name}"
+            dst.write_bytes(src.read_bytes())
+            saved.append(dst)
+        return saved
 
 
 def _process_attachment_batch(batch: list[Path], kind: str, out_dir: Path | None = None) -> Path:
@@ -125,26 +159,88 @@ def _merge_pdf_group(pdfs: list[Path]) -> Path | None:
     return out_path
 
 
-def _split_pdf_by_pages(pdf: Path) -> list[Path]:
-
-    budget = settings.pdf_max_size_mb * 1024 * 1024
-    reader = PdfReader(str(pdf))
-    total_pages = len(reader.pages)
-    if total_pages < 2:
-        return [pdf]
-    size_per_page = max(1, pdf.stat().st_size // total_pages)
-    max_pages = max(1, budget // size_per_page)
-    parts: list[Path] = []
-    for start in range(0, total_pages, max_pages):
-        writer = PdfWriter()
-        for i in range(start, min(start + max_pages, total_pages)):
-            writer.add_page(reader.pages[i])
-        out_path = PDF_MERGE_DIR / f"{pdf.stem}_part{len(parts) + 1}.pdf"
-        with open(out_path, "wb") as f:
-            writer.write(f)
-        parts.append(out_path)
-        logger.info(f"PDF разбит: часть {len(parts)} — страницы {start + 1}-{min(start + max_pages, total_pages)} ({out_path.stat().st_size // 1048576} МБ)")
+logger.info(f"PDF разбит: часть {len(parts)} — страницы {start + 1}-{min(start + max_pages, total_pages)} ({out_path.stat().st_size // 1048576} МБ)")
     return parts
+
+
+def _process_pdf_as_images(pdf: Path, weights: dict, progress, out_dir: Path | None, quiet: bool) -> list[Path]:
+    """Fallback: конвертирует PDF в изображения и обрабатывает через Vision модель."""
+    if not PDF2IMAGE_AVAILABLE:
+        logger.error(f"PDF {pdf.name}: pdf2image не установлен, невозможно обработать скан")
+        if progress:
+            progress({"log": f"PDF {pdf.name}: нужен pdf2image для сканированных PDF"})
+        return []
+    
+    if progress and not quiet:
+        progress({"file": f"PDF (скан): {pdf.name}", "file_index": 1, "file_total": 1})
+    if progress:
+        progress({"log": f"PDF {pdf.name}: конвертирую страницы в изображения…"})
+    
+    try:
+        # Конвертируем в изображения
+        image_paths = _pdf_to_images(pdf, dpi=200)
+        if not image_paths:
+            logger.warning(f"PDF {pdf.name}: не удалось извлечь страницы")
+            return []
+        
+        logger.info(f"PDF {pdf.name}: извлечено {len(image_paths)} страниц как изображения")
+        if progress:
+            progress({"log": f"PDF {pdf.name}: {len(image_paths)} страниц → Vision модель"})
+        
+        # Обрабатываем батчами через Vision модель
+        results = []
+        batch_size = max(1, min(settings.nim_images_per_batch, len(image_paths)))
+        
+        for bi in range(0, len(image_paths), batch_size):
+            batch = image_paths[bi:bi + batch_size]
+            if progress and not quiet:
+                progress({"file": f"PDF (скан): батч {bi//batch_size + 1}/{(len(image_paths)-1)//batch_size + 1}", 
+                          "file_index": bi//batch_size + 1, 
+                          "file_total": (len(image_paths)-1)//batch_size + 1})
+            if progress:
+                progress({"log": f"Vision: страница {bi+1}-{min(bi+batch_size, len(image_paths))} из {len(image_paths)}"})
+            
+            # Кэш для этого батча
+            key = "|".join(f"{p.name}:{p.stat().st_size}" for p in batch)
+            h = hashlib.sha256(key.encode("utf-8")).hexdigest()
+            text = get_cached_fragment(h)
+            
+            if not text:
+                prompt = build_images_prompt(len(batch))
+                text = nim_client.send_prompt(
+                    prompt,
+                    deepthink=False,
+                    expert=False,
+                    stable_rounds=6,
+                    attachments=[str(p.resolve()) for p in batch],
+                )
+                save_fragment_cache(h, "pdf_scan", text)
+            
+            # Сохраняем результат батча
+            target_dir = out_dir or settings.results_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            out_path = target_dir / f"{pdf.stem}_scan_{h[:8]}.txt"
+            header = _header_block(
+                f"PDF СКАН (страницы {bi+1}-{min(bi+batch_size, len(image_paths))})",
+                [
+                    ("Документ", pdf.name),
+                    ("Страниц", len(batch)),
+                    ("Дата", time.strftime("%d.%m.%Y %H:%M")),
+                ],
+            )
+            out_path.write_text(header + text.strip() + "\n\n" + _footer_block("распознавания"), encoding="utf-8")
+            results.append(out_path)
+            logger.info(f"Vision PDF готов: {out_path.name}")
+            if progress:
+                progress({"log": f"Vision PDF готов: {out_path.name}"})
+        
+        return results
+    
+    except Exception as exc:
+        logger.error(f"PDF {pdf.name}: ошибка Vision fallback {type(exc).__name__}: {exc}")
+        if progress:
+            progress({"log": f"Ошибка Vision fallback: {pdf.name} — {exc}"})
+        return []
 
 
 def _process_single_pdf(pdf: Path, weights: dict, progress, out_dir: Path | None, quiet: bool) -> list[Path]:
@@ -164,10 +260,10 @@ def _process_single_pdf(pdf: Path, weights: dict, progress, out_dir: Path | None
                 lines.append(text[:500])
         
         if not lines:
-            logger.warning(f"PDF {pdf.name}: текст не извлечён (скан без текстового слоя?)")
+            logger.warning(f"PDF {pdf.name}: текст не извлечён — пробуем Vision fallback")
             if progress:
-                progress({"log": f"PDF {pdf.name}: нет текстового слоя — пропущен"})
-            return []
+                progress({"log": f"PDF {pdf.name}: нет текстового слоя — Vision fallback…"})
+            return _process_pdf_as_images(pdf, weights, progress, out_dir, quiet)
         
         # Check cache
         h = hashlib.sha256(f"{pdf.stem}.pdf|{pdf.stat().st_size}".encode("utf-8")).hexdigest()
