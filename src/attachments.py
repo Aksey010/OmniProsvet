@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 
 from loguru import logger
+from pypdf import PdfReader, PdfWriter
 
 from src.configuration import settings
 from src.database import get_cached_fragment, save_fragment_cache
@@ -106,7 +107,6 @@ def _merge_pdf_group(pdfs: list[Path]) -> Path | None:
     if out_path.exists():
         return out_path
     PDF_MERGE_DIR.mkdir(parents=True, exist_ok=True)
-    from pypdf import PdfReader, PdfWriter
 
     writer = PdfWriter()
     for pdf in pdfs:
@@ -126,7 +126,6 @@ def _merge_pdf_group(pdfs: list[Path]) -> Path | None:
 
 
 def _split_pdf_by_pages(pdf: Path) -> list[Path]:
-    from pypdf import PdfReader, PdfWriter
 
     budget = settings.pdf_max_size_mb * 1024 * 1024
     reader = PdfReader(str(pdf))
@@ -146,81 +145,6 @@ def _split_pdf_by_pages(pdf: Path) -> list[Path]:
         parts.append(out_path)
         logger.info(f"PDF разбит: часть {len(parts)} — страницы {start + 1}-{min(start + max_pages, total_pages)} ({out_path.stat().st_size // 1048576} МБ)")
     return parts
-
-
-def run_pdfs_nim(pdfs: list[Path], weights: dict, progress=None, out_dir: Path | None = None, quiet: bool = False) -> list[Path]:
-    if progress and not quiet:
-        progress({"phase": "pdf", "weight": weights.get("pdf", 0)})
-    from concurrent.futures import ThreadPoolExecutor
-    from src.analysis import _FragProgress, _process_fragment, _submit_fragments, _collect_results
-
-    executor = ThreadPoolExecutor(max_workers=settings.nim_workers)
-    tracker = _FragProgress("pdf", 1.0, progress)
-    target_dir = out_dir or settings.results_dir
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    results: list[Path] = []
-    futures_by_pdf: dict[str, list] = {}
-    order: list[Path] = []
-    total = len(pdfs)
-
-    for idx, pdf in enumerate(pdfs, 1):
-        if progress and not quiet:
-            progress({"file": f"PDF: {pdf.name}", "file_index": idx, "file_total": total})
-        if progress:
-            progress({"log": f"PDF: извлекаю текст из {pdf.name}…"})
-        try:
-            from pypdf import PdfReader
-
-            reader = PdfReader(str(pdf))
-            lines = []
-            for page in reader.pages:
-                text = (page.extract_text() or "").strip()
-                if text:
-                    lines.append(text[:500])
-            if not lines:
-                logger.warning(f"PDF {pdf.name}: текст не извлечён (скан без текстового слоя?)")
-                if progress:
-                    progress({"log": f"PDF {pdf.name}: нет текстового слоя — пропущен"})
-                continue
-            source = f"{pdf.stem}.pdf"
-            budget = settings.nim_chunk_char_budget
-            chunks = _chunk_lines(lines, budget)
-            futures_by_pdf[source] = _submit_fragments(source, chunks, [nim_client] * settings.nim_workers, executor, tracker, progress)
-            order.append(pdf)
-        except NimError:
-            raise
-        except Exception as exc:
-            logger.error(f"PDF {pdf.name}: ошибка {type(exc).__name__}: {exc}")
-            if progress:
-                progress({"log": f"Ошибка: {pdf.name} — {exc}"})
-
-    executor.shutdown(wait=True)
-
-    for pdf in order:
-        source = f"{pdf.stem}.pdf"
-        futures = futures_by_pdf.get(source, [])
-        try:
-            texts = [fut.result() for fut in futures]
-        except Exception as exc:
-            logger.error(f"PDF {pdf.name}: ошибка фрагментов {exc}")
-            continue
-        h = hashlib.sha256(f"{pdf.stem}.pdf|{pdf.stat().st_size}".encode("utf-8")).hexdigest()
-        out_path = target_dir / f"{pdf.stem}_{h[:8]}.pdf.txt"
-        header = _header_block(
-            "КОНСПЕКТ PDF",
-            [
-                ("Документ", pdf.name),
-                ("Фрагментов", len(texts)),
-                ("Дата", time.strftime("%d.%m.%Y %H:%M")),
-            ],
-        )
-        out_path.write_text(header + "\n\n".join(texts).strip() + "\n\n" + _footer_block("конспекта"), encoding="utf-8")
-        results.append(out_path)
-        logger.info(f"Конспект PDF готов: {out_path.name} ({len(texts)} фрагментов)")
-        if progress:
-            progress({"log": f"Конспект PDF готов: {out_path.name}"})
-    return results
 
 
 def run_pdfs(pdfs: list[Path], weights: dict, progress=None, out_dir: Path | None = None, quiet: bool = False) -> list[Path]:

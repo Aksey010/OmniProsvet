@@ -13,7 +13,7 @@ class TestPipelineHelpers:
     def test_weights_for_extract_and_process(self):
         weights = _weights_for(extract=True, process=True, att_kinds=["images", "pdf"])
         assert "transcribe" in weights
-        assert "deepseek" in weights
+        assert "analysis" in weights
         assert "images" in weights
         assert "pdf" in weights
         assert sum(weights.values()) == 100
@@ -24,7 +24,7 @@ class TestPipelineHelpers:
 
     def test_weights_for_process_only(self):
         weights = _weights_for(extract=False, process=True, att_kinds=[])
-        assert weights == {"deepseek": 100}
+        assert weights == {"analysis": 100}
 
     def test_weights_for_attachments_only(self):
         weights = _weights_for(extract=False, process=False, att_kinds=["images", "documents"])

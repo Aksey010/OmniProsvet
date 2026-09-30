@@ -8,7 +8,7 @@ from src.configuration import settings
 from src.database import init_db
 from src.transcription import run_extract, run_extract_and_process
 from src.analysis import run_process_only
-from src.attachments import run_attachments, run_pdfs, _att_kinds
+from src.attachments import run_attachments, run_pdfs
 
 
 def _group_names(paths: list[Path]) -> dict[str, str]:
@@ -29,11 +29,11 @@ def _group_names(paths: list[Path]) -> dict[str, str]:
 
 def _weights_for(extract: bool, process: bool, att_kinds: list[str]) -> dict:
     if extract and process:
-        weights = {"transcribe": 45, "deepseek": 30}
+        weights = {"transcribe": 45, "analysis": 30}
     elif extract:
         weights = {"transcribe": 80}
     else:
-        weights = {"deepseek": 75}
+        weights = {"analysis": 75}
     if att_kinds:
         base = 100 - sum(weights.values())
         each = round(base / len(att_kinds), 1)
@@ -41,11 +41,11 @@ def _weights_for(extract: bool, process: bool, att_kinds: list[str]) -> dict:
             weights[kind] = each
         weights[att_kinds[-1]] = round(base - each * (len(att_kinds) - 1), 1)
     elif extract and process:
-        weights = {"transcribe": 60, "deepseek": 40}
+        weights = {"transcribe": 60, "analysis": 40}
     elif extract:
         weights = {"transcribe": 100}
     else:
-        weights = {"deepseek": 100}
+        weights = {"analysis": 100}
     return weights
 
 

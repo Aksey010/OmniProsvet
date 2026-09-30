@@ -18,6 +18,22 @@ from src.utils import (
     _prepare_transcript,
     _transcript_source_label,
 )
+
+
+def run_extract(
+    media_files: list[tuple[Path, Path]],
+    model: str,
+    language: str,
+    diarize: bool,
+    weights: dict,
+    progress=None,
+) -> list[Path]:
+    if not media_files:
+        return []
+    logger.info(
+        f"Транскрибация: {len(media_files)} файлов, модель {model}, "
+        f"язык {language}, диаризация: {'вкл' if diarize else 'выкл'}"
+    )
     if progress:
         progress({"log": f"Транскрибация: {len(media_files)} файлов"})
         progress({"phase": "transcribe", "weight": weights.get("transcribe", 100)})
@@ -50,9 +66,6 @@ from src.utils import (
             if progress:
                 progress({"log": f"Ошибка транскрибации {f.name}: {exc}"})
     return results
-
-
-def run_extract_and_process(
     media_files: list[tuple[Path, Path]],
     model: str,
     language: str,

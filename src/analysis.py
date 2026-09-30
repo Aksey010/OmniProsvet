@@ -47,19 +47,6 @@ class _FragProgress:
         self._emit({"p": self._phase, "phase_progress": frac})
 
 
-def _chunk_hash(source: str, chunk: list[str]) -> str:
-    return hashlib.sha256((source + "|" + "\n".join(chunk)).encode("utf-8")).hexdigest()
-
-
-def _is_small_chunk(chunk: list[str], budget: int | None = None) -> bool:
-    b = budget or settings.chunk_char_budget
-    size = sum(len(line) for line in chunk)
-    return (
-        size <= b // 2
-        and len(chunk) <= settings.chunk_max_lines // 2
-    )
-
-
 class _SmallBuffer:
     def __init__(self, executor: ThreadPoolExecutor, tracker: _FragProgress, progress) -> None:
         self.lines: list[str] = []
@@ -168,7 +155,7 @@ def _reduce_and_save(
 ) -> Path:
     if progress:
         progress({"log": "Фрагменты готовы, собираю финальный отчёт…"})
-        progress({"p": "deepseek", "phase_progress": 0.95})
+        progress({"p": "analysis", "phase_progress": 0.95})
     parts = [fut.result() for fut in all_futures]
     parts_block = "\n\n".join(f"### Фрагмент {i}\n{p}" for i, p in enumerate(parts, 1))
     final = nim_client.send_prompt(
@@ -191,7 +178,7 @@ def _reduce_and_save(
     )
     out_path.write_text(header + final.strip() + "\n\n" + _footer_block("отчёта"), encoding="utf-8")
     if progress:
-        progress({"p": "deepseek", "phase_progress": 1.0})
+        progress({"p": "analysis", "phase_progress": 1.0})
     logger.info(f"Единый отчёт готов: {out_path}")
     return out_path
 
@@ -218,10 +205,10 @@ def run_process_only(
     logger.info(f"Обработка: {len(transcripts)} транскриптов, NIM workers: {settings.nim_workers}")
     if progress:
         progress({"log": f"NIM: {len(transcripts)} транскриптов, workers: {settings.nim_workers}"})
-        progress({"phase": "deepseek", "weight": weights.get("deepseek", 100)})
+        progress({"phase": "analysis", "weight": weights.get("analysis", weights.get("deepseek", 100))})
 
     executor = ThreadPoolExecutor(max_workers=settings.nim_workers)
-    tracker = _FragProgress("deepseek", REDUCE_FRACTION, progress)
+    tracker = _FragProgress("analysis", REDUCE_FRACTION, progress)
     budget = settings.nim_chunk_char_budget
     futures_map: dict[str, list] = {}
     small_buffer = _SmallBuffer(executor, tracker, progress)
