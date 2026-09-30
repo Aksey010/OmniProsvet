@@ -50,18 +50,35 @@ def _weights_for(extract: bool, process: bool, att_kinds: list[str]) -> dict:
 
 
 def _attachments_worker(att_plan: list, weights: dict, progress, reports: list) -> None:
+    """Process all attachment types in parallel."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    tasks = []
     for kind, files, gdir in att_plan:
         if not files:
             continue
-        try:
+        tasks.append((kind, files, gdir))
+    
+    if not tasks:
+        return
+    
+    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+        futures = {}
+        for kind, files, gdir in tasks:
             if kind == "pdf":
-                reports += run_pdfs(files, weights, progress, gdir, quiet=True)
+                fut = executor.submit(run_pdfs, files, weights, progress, gdir, True)
             else:
-                reports += run_attachments(files, kind, weights, gdir, progress, quiet=True)
-        except Exception as exc:
-            logger.error(f"Обработка {kind} упала: {type(exc).__name__}: {exc}")
-            if progress:
-                progress({"log": f"Ошибка обработки {kind}: {exc}"})
+                fut = executor.submit(run_attachments, files, kind, weights, gdir, progress, True)
+            futures[fut] = kind
+        
+        for fut in as_completed(futures):
+            kind = futures[fut]
+            try:
+                reports.extend(fut.result())
+            except Exception as exc:
+                logger.error(f"Обработка {kind} упала: {type(exc).__name__}: {exc}")
+                if progress:
+                    progress({"log": f"Ошибка обработки {kind}: {exc}"})
 
 
 def run_pipeline(
@@ -124,6 +141,7 @@ def run_pipeline(
         if progress:
             progress({"log": "Картинки, PDF и документы обрабатываются параллельно"})
     elif kinds:
+        # Process sequentially but each kind in parallel internally
         for kind, files, gdir in att_plan:
             try:
                 if kind == "pdf":

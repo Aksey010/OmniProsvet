@@ -44,14 +44,14 @@ class Settings:
     nim_model: str = os.getenv("NIM_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
     nim_reduce_model: str = os.getenv("NIM_REDUCE_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
     nim_vision_model: str = os.getenv("NIM_VISION_MODEL", "meta/llama-3.2-90b-vision-instruct")
-    nim_rpm: int = _as_int("NIM_RPM", 40)
-    nim_max_tokens: int = _as_int("NIM_MAX_TOKENS", 16384)
+    nim_rpm: int = _as_int("NIM_RPM", 120)  # Увеличено для параллелизма
+    nim_max_tokens: int = _as_int("NIM_MAX_TOKENS", 8192)  # Уменьшено для скорости
     nim_temperature: float = _as_float("NIM_TEMPERATURE", 0.7)
     nim_frequency_penalty: float = _as_float("NIM_FREQUENCY_PENALTY", 0.4)
     nim_presence_penalty: float = _as_float("NIM_PRESENCE_PENALTY", 0.3)
-    nim_workers: int = _as_int("NIM_WORKERS", 8)
-    nim_images_per_batch: int = _as_int("NIM_IMAGES_PER_BATCH", 5)
-    nim_chunk_char_budget: int = _as_int("NIM_CHUNK_CHAR_BUDGET", 12000)
+    nim_workers: int = _as_int("NIM_WORKERS", 16)  # Увеличено для параллелизма
+    nim_images_per_batch: int = _as_int("NIM_IMAGES_PER_BATCH", 3)  # Меньше батч = больше параллелизма
+    nim_chunk_char_budget: int = _as_int("NIM_CHUNK_CHAR_BUDGET", 8000)  # Меньшие чанки = больше параллелизма
 
     # Пути
     base_dir: Path = Path(__file__).resolve().parent.parent

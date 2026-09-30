@@ -1,8 +1,10 @@
+import asyncio
 import base64
 import hashlib
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import httpx
 from loguru import logger
@@ -26,6 +28,8 @@ class NimClient:
         self._model = model or settings.nim_model
         self._vision_model = vision_model or settings.nim_vision_model
         self._requests_left: int | None = None
+        self._async_client: Optional[httpx.AsyncClient] = None
+        self._client_lock = threading.Lock()
 
     @property
     def model(self) -> str:
@@ -231,6 +235,115 @@ class NimClient:
             raise NimError(f"NIM: HTTP {response.status_code}: {detail[:500]}")
 
         raise NimError(f"NIM: не удалось получить ответ после {MAX_RETRIES} попыток. {last_error}")
+
+    def _get_async_client(self) -> httpx.AsyncClient:
+        """Get or create async HTTP client with connection pooling."""
+        if self._async_client is None or self._async_client.is_closed:
+            with self._client_lock:
+                if self._async_client is None or self._async_client.is_closed:
+                    limits = httpx.Limits(
+                        max_connections=settings.nim_workers,
+                        max_keepalive_connections=settings.nim_workers,
+                        keepalive_expiry=30.0,
+                    )
+                    self._async_client = httpx.AsyncClient(
+                        base_url=NIM_BASE_URL,
+                        headers={
+                            "Authorization": f"Bearer {settings.nim_api_key}",
+                            "Accept": "application/json",
+                        },
+                        timeout=httpx.Timeout(300.0),
+                        limits=limits,
+                    )
+        return self._async_client
+
+    async def send_prompt_async(
+        self,
+        prompt: str,
+        deepthink: bool = True,
+        expert: bool = True,
+        attachments: list[str] | None = None,
+        stable_rounds: int = 12,
+        model: str | None = None,
+    ) -> str:
+        """Async version of send_prompt with connection pooling."""
+        if not settings.nim_api_key:
+            raise NimError("NIM_API_KEY не задан в .env — добавьте ключ с build.nvidia.com")
+        
+        messages = self._build_messages(prompt, attachments)
+        if attachments:
+            chosen = self._vision_model
+        elif model:
+            chosen = model
+        else:
+            chosen = self._model
+        
+        payload = {
+            "model": chosen,
+            "messages": messages,
+            "max_tokens": settings.nim_max_tokens,
+            "temperature": settings.nim_temperature,
+            "frequency_penalty": settings.nim_frequency_penalty,
+            "presence_penalty": settings.nim_presence_penalty,
+            "stream": False,
+        }
+
+        last_error = ""
+        for attempt in range(1, MAX_RETRIES + 1):
+            self._pace()
+            logger.info(f"NIM async: запрос к {chosen} ({len(prompt)} симв., попытка {attempt}/{MAX_RETRIES})…")
+            try:
+                client = self._get_async_client()
+                response = await client.post(
+                    "/chat/completions",
+                    json=payload,
+                    timeout=300.0,
+                )
+            except httpx.HTTPError as exc:
+                last_error = f"Сеть: {type(exc).__name__}: {exc}"
+                logger.warning(f"{last_error} — повтор {attempt}/{MAX_RETRIES}")
+                await asyncio.sleep(min(30, 5 * attempt))
+                continue
+
+            self._note_headers(response.headers)
+
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    text = data["choices"][0]["message"]["content"] or ""
+                    finish = data["choices"][0].get("finish_reason", "") or ""
+                except (KeyError, IndexError, ValueError) as exc:
+                    raise NimError(f"NIM: неожиданный формат ответа: {exc}")
+                if finish == "length":
+                    logger.warning(
+                        "NIM: ответ ОБРЕЗАН по NIM_MAX_TOKENS — фрагмент неполный, увеличьте NIM_MAX_TOKENS в .env"
+                    )
+                    text = text + "\n[ОТВЕТ ОБРЕЗАН ПО ЛИМИТУ — фрагмент неполный]"
+                logger.info(f"NIM async: ответ получен ({len(text)} симв., finish={finish or 'stop'})")
+                return text.strip()
+
+            if response.status_code in RETRYABLE_STATUS:
+                retry_after = response.headers.get("retry-after")
+                wait = float(retry_after) if retry_after and retry_after.replace(".", "").isdigit() else min(60, 10 * attempt)
+                last_error = f"NIM: HTTP {response.status_code} (лимит запросов?)"
+                logger.warning(f"{last_error} — жду {wait:.0f}с, повтор {attempt}/{MAX_RETRIES}")
+                await asyncio.sleep(wait)
+                continue
+
+            detail = ""
+            try:
+                detail = str(response.json())
+            except ValueError:
+                detail = response.text[:300]
+            raise NimError(f"NIM: HTTP {response.status_code}: {detail[:500]}")
+
+        raise NimError(f"NIM: не удалось получить ответ после {MAX_RETRIES} попыток. {last_error}")
+
+    async def close(self) -> None:
+        """Close async client."""
+        if self._async_client and not self._async_client.is_closed:
+            await self._async_client.aclose()
+            self._async_client = None
 
 
 client = NimClient()

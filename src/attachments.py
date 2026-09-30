@@ -147,78 +147,102 @@ def _split_pdf_by_pages(pdf: Path) -> list[Path]:
     return parts
 
 
+def _process_single_pdf(pdf: Path, weights: dict, progress, out_dir: Path | None, quiet: bool) -> list[Path]:
+    """Process a single PDF file."""
+    try:
+        if progress and not quiet:
+            progress({"file": f"PDF: {pdf.name}", "file_index": 1, "file_total": 1})
+        if progress:
+            progress({"log": f"PDF: извлекаю текст из {pdf.name}…"})
+        
+        from pypdf import PdfReader
+        reader = PdfReader(str(pdf))
+        lines = []
+        for page in reader.pages:
+            text = (page.extract_text() or "").strip()
+            if text:
+                lines.append(text[:500])
+        
+        if not lines:
+            logger.warning(f"PDF {pdf.name}: текст не извлечён (скан без текстового слоя?)")
+            if progress:
+                progress({"log": f"PDF {pdf.name}: нет текстового слоя — пропущен"})
+            return []
+        
+        # Check cache
+        h = hashlib.sha256(f"{pdf.stem}.pdf|{pdf.stat().st_size}".encode("utf-8")).hexdigest()
+        text = get_cached_fragment(h)
+        
+        if not text:
+            budget = settings.nim_chunk_char_budget
+            chunks = _chunk_lines(lines, budget)
+            if not chunks:
+                return []
+            
+            from concurrent.futures import ThreadPoolExecutor
+            from src.analysis import _FragProgress, _process_fragment, _submit_fragments, _collect_results
+            
+            executor = ThreadPoolExecutor(max_workers=min(settings.nim_workers, len(chunks)))
+            tracker = _FragProgress("pdf", 1.0, progress)
+            
+            futures = _submit_fragments(f"{pdf.stem}.pdf", chunks, [nim_client] * min(settings.nim_workers, len(chunks)), executor, tracker, progress)
+            executor.shutdown(wait=True)
+            
+            texts = [fut.result() for fut in futures]
+            text = "\n\n".join(texts)
+            save_fragment_cache(h, "pdf", text)
+        
+        target_dir = out_dir or settings.results_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        out_path = target_dir / f"{pdf.stem}_{h[:8]}.pdf.txt"
+        header = _header_block(
+            "КОНСПЕКТ PDF",
+            [
+                ("Документ", pdf.name),
+                ("Фрагментов", len(text.split("\n\n")) if text else 0),
+                ("Дата", time.strftime("%d.%m.%Y %H:%M")),
+            ],
+        )
+        out_path.write_text(header + text.strip() + "\n\n" + _footer_block("конспекта"), encoding="utf-8")
+        logger.info(f"Конспект PDF готов: {out_path.name}")
+        if progress:
+            progress({"log": f"Конспект PDF готов: {out_path.name}"})
+        return [out_path]
+    except NimError as exc:
+        logger.error(f"PDF {pdf.name}: ошибка {exc}")
+        if progress:
+            progress({"log": f"Ошибка: {pdf.name} — {exc}"})
+        return []
+    except Exception as exc:
+        logger.error(f"PDF {pdf.name}: ошибка {type(exc).__name__}: {exc}")
+        if progress:
+            progress({"log": f"Ошибка: {pdf.name} — {exc}"})
+        return []
+
+
 def run_pdfs(pdfs: list[Path], weights: dict, progress=None, out_dir: Path | None = None, quiet: bool = False) -> list[Path]:
     if not pdfs:
         return []
-    groups = _pdf_groups(pdfs)
-    budget = settings.pdf_max_size_mb * 1024 * 1024
-    logger.info(
-        f"PDF: {len(pdfs)} шт. → {len(groups)} объединённых файлов (лимит {settings.pdf_max_size_mb} МБ)"
-    )
+    
+    logger.info(f"PDF: {len(pdfs)} шт. (параллельно по {min(settings.nim_workers, len(pdfs))} файлов)")
     if progress and not quiet:
         progress({"phase": "pdf", "weight": weights.get("pdf", 0)})
 
     results: list[Path] = []
-    for gi, group in enumerate(groups, 1):
-        if progress and not quiet:
-            progress({"file": f"PDF: {len(group)} шт. в одном", "file_index": gi, "file_total": len(groups)})
-        if progress:
-            progress({"log": f"PDF: группа {gi}/{len(groups)} ({len(group)} шт. в одном файле)…"})
-        try:
-            h = hashlib.sha256(("|".join(f"{p.name}:{p.stat().st_size}" for p in group)).encode("utf-8")).hexdigest()
-            text = get_cached_fragment(h)
-            merged = None
-            if not text:
-                merged = _merge_pdf_group(group)
-                if merged is None:
-                    continue
-                if merged.stat().st_size > budget:
-                    if len(group) > 1:
-                        logger.warning(
-                            f"Склеенный файл {merged.name} ({merged.stat().st_size // 1048576} МБ) превышает лимит — режу группу пополам"
-                        )
-                        mid = len(group) // 2
-                        results += run_pdfs(group[:mid], weights, progress, quiet=True)
-                        results += run_pdfs(group[mid:], weights, progress, quiet=True)
-                        continue
-                    else:
-                        parts = _split_pdf_by_pages(group[0])
-                        if len(parts) > 1:
-                            results += run_pdfs(parts, weights, progress, quiet=True)
-                            continue
-                text = nim_client.send_prompt(
-                    build_documents_prompt(len(group)),
-                    deepthink=False,
-                    expert=False,
-                    stable_rounds=6,
-                    attachments=[str(merged.resolve())],
-                )
-                save_fragment_cache(h, "pdf", text)
-            target_dir = out_dir or settings.results_dir
-            target_dir.mkdir(parents=True, exist_ok=True)
-            out_path = target_dir / f"{group[0].stem}_{h[:8]}.pdf.txt"
-            header = _header_block(
-                "КОНСПЕКТ PDF",
-                [
-                    ("Документов", len(group)),
-                    ("Объединено", f"{merged.name} ({merged.stat().st_size // 1048576} МБ)" if merged else ""),
-                    ("Дата", time.strftime("%d.%m.%Y %H:%M")),
-                ],
-            )
-            out_path.write_text(header + text.strip() + "\n\n" + _footer_block("конспекта"), encoding="utf-8")
-            results.append(out_path)
-            if progress:
-                progress({"p": "pdf", "phase_progress": gi / len(groups)})
-        except NimError as exc:
-            if len(group) > 1:
-                logger.warning(f"Группа {gi} из {len(group)} PDF не прошла ({exc}) — режу пополам и повторяю")
+    max_workers = min(settings.nim_workers, len(pdfs), 4)
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_process_single_pdf, pdf, weights, progress, out_dir, quiet): pdf
+            for pdf in pdfs
+        }
+        for fut in as_completed(futures):
+            try:
+                results.extend(fut.result())
+            except Exception as exc:
+                pdf = futures[fut]
+                logger.error(f"PDF {pdf.name}: ошибка в потоке {exc}")
                 if progress:
-                    progress({"log": f"Группа PDF не прошла — режу пополам"})
-                mid = len(group) // 2
-                results += run_pdfs(group[:mid], weights, progress, quiet=True)
-                results += run_pdfs(group[mid:], weights, progress, quiet=True)
-            else:
-                logger.error(f"PDF {group[0].name}: ошибка {exc}")
-                if progress:
-                    progress({"log": f"Ошибка: {group[0].name} — {exc}"})
+                    progress({"log": f"Ошибка: {pdf.name} — {exc}"})
+    
     return results

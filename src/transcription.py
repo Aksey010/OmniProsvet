@@ -1,7 +1,7 @@
 import hashlib
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from queue import Queue
 
@@ -20,6 +20,36 @@ from src.utils import (
 )
 
 
+def _transcribe_single(media_file: tuple[Path, Path], model: str, language: str, diarize: bool, progress, idx: int, total: int) -> Path | None:
+    """Transcribe a single file with progress reporting."""
+    f, gdir = media_file
+    if progress:
+        progress({"file": f.name, "file_index": idx, "file_total": total})
+    try:
+        out = transcribe_file(
+            f,
+            model,
+            language,
+            diarize=diarize,
+            on_progress=(
+                lambda pct, _i=idx, _t=total: progress(
+                    {"p": "transcribe", "phase_progress": (_i - 1 + pct / 100) / _t}
+                )
+            )
+            if progress
+            else None,
+            group_dir=gdir,
+        )
+        if progress:
+            progress({"log": f"Транскрипт готов: {out.name}"})
+        return out
+    except Exception as exc:
+        logger.error(f"Ошибка транскрибации {f.name}: {exc}")
+        if progress:
+            progress({"log": f"Ошибка транскрибации {f.name}: {exc}"})
+        return None
+
+
 def run_extract(
     media_files: list[tuple[Path, Path]],
     model: str,
@@ -27,44 +57,34 @@ def run_extract(
     diarize: bool,
     weights: dict,
     progress=None,
+    max_workers: int | None = None,
 ) -> list[Path]:
     if not media_files:
         return []
+    
+    max_workers = max_workers or min(4, len(media_files))
     logger.info(
         f"Транскрибация: {len(media_files)} файлов, модель {model}, "
-        f"язык {language}, диаризация: {'вкл' if diarize else 'выкл'}"
+        f"язык {language}, диаризация: {'вкл' if diarize else 'выкл'}, "
+        f"воркеров: {max_workers}"
     )
     if progress:
-        progress({"log": f"Транскрибация: {len(media_files)} файлов"})
+        progress({"log": f"Транскрибация: {len(media_files)} файлов (параллельно: {max_workers})"})
         progress({"phase": "transcribe", "weight": weights.get("transcribe", 100)})
 
     results: list[Path] = []
     total = len(media_files)
-    for idx, (f, gdir) in enumerate(media_files, 1):
-        if progress:
-            progress({"file": f.name, "file_index": idx, "file_total": total})
-        try:
-            out = transcribe_file(
-                f,
-                model,
-                language,
-                diarize=diarize,
-                on_progress=(
-                    lambda pct, _i=idx, _t=total: progress(
-                        {"p": "transcribe", "phase_progress": (_i - 1 + pct / 100) / _t}
-                    )
-                )
-                if progress
-                else None,
-                group_dir=gdir,
-            )
-            results.append(out)
-            if progress:
-                progress({"log": f"Транскрипт готов: {out.name}"})
-        except Exception as exc:
-            logger.error(f"Ошибка транскрибации {f.name}: {exc}")
-            if progress:
-                progress({"log": f"Ошибка транскрибации {f.name}: {exc}"})
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_transcribe_single, mf, model, language, diarize, progress, i, total): i
+            for i, mf in enumerate(media_files, 1)
+        }
+        for fut in as_completed(futures):
+            out = fut.result()
+            if out:
+                results.append(out)
+
     return results
 
 
@@ -77,65 +97,31 @@ def run_extract_and_process(
     weights: dict,
     progress=None,
 ) -> tuple[list[Path], list[Path]]:
-    import queue as q_mod
-
     if not media_files:
         return [], []
 
+    max_workers = min(4, len(media_files))
     logger.info(
         f"Транскрибация + обработка: {len(media_files)} файлов, модель {model}, "
-        f"язык {language}, диаризация: {'вкл' if diarize else 'выкл'}"
+        f"язык {language}, диаризация: {'вкл' if diarize else 'выкл'}, "
+        f"воркеров: {max_workers}"
     )
     if progress:
-        progress({"log": f"Транскрибация: {len(media_files)} файлов (обработка идёт параллельно)"})
+        progress({"log": f"Транскрибация: {len(media_files)} файлов (параллельно: {max_workers})"})
         progress({"phase": "transcribe", "weight": weights.get("transcribe", 50)})
 
-    q: q_mod.Queue = q_mod.Queue()
     transcripts_order: list[Path] = []
     lock = threading.Lock()
 
-    def transcribe_worker() -> None:
-        total = len(media_files)
-        for idx, (f, gdir) in enumerate(media_files, 1):
-            if progress:
-                progress({"file": f.name, "file_index": idx, "file_total": total})
-            try:
-                out = transcribe_file(
-                    f,
-                    model,
-                    language,
-                    diarize=diarize,
-                    on_progress=(
-                        lambda pct, _i=idx, _t=total: progress(
-                            {"p": "transcribe", "phase_progress": (_i - 1 + pct / 100) / _t}
-                        )
-                    )
-                    if progress
-                    else None,
-                    group_dir=gdir,
-                )
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_transcribe_single, mf, model, language, diarize, progress, i, len(media_files)): i
+            for i, mf in enumerate(media_files, 1)
+        }
+        for fut in as_completed(futures):
+            out = fut.result()
+            if out:
                 with lock:
                     transcripts_order.append(out)
-                if progress:
-                    progress({"log": f"Транскрипт готов: {out.name}"})
-                q.put(out)
-            except Exception as exc:
-                logger.error(f"Ошибка транскрибации {f.name}: {exc}")
-                if progress:
-                    progress({"log": f"Ошибка транскрибации {f.name}: {exc}"})
-        q.put(None)
 
-    t_thread = threading.Thread(target=transcribe_worker, name="omni-transcriber")
-    t_thread.start()
-    t_thread.join()
-
-    # Collect all transcripts from queue
-    all_transcripts: list[Path] = []
-    while True:
-        t = q.get()
-        if t is None:
-            break
-        all_transcripts.append(t)
-        q.task_done()
-
-    return transcripts_order, all_transcripts
+    return transcripts_order, transcripts_order
