@@ -1,0 +1,9 @@
+faster-whisper>=1.0.0
+polyvoice>=0.21.0
+pypdf>=4.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+selenium>=4.15.0
+flask>=3.0.0
+python-dotenv>=1.0.0
+loguru>=0.7.1
