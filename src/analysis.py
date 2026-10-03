@@ -202,10 +202,35 @@ def run_process_only(
         logger.warning("Транскрипты не найдены")
         return [], None
 
+    return _run_analysis_on_transcripts(transcripts, out_dir, weights, progress)
+
+
+def run_analysis_on_transcripts(
+    transcripts: list[Path],
+    out_dir: Path | None,
+    weights: dict,
+    progress=None,
+) -> tuple[list[Path], Path | None]:
+    """Run Map/Reduce analysis on pre-existing transcript files."""
+    uniq = {str(t): t for t in transcripts}
+    transcripts = sorted(uniq.values(), key=lambda x: x.name)
+    if not transcripts:
+        logger.warning("Транскрипты не найдены")
+        return [], None
+
+    return _run_analysis_on_transcripts(transcripts, out_dir, weights, progress)
+
+
+def _run_analysis_on_transcripts(
+    transcripts: list[Path],
+    out_dir: Path | None,
+    weights: dict,
+    progress=None,
+) -> tuple[list[Path], Path | None]:
     logger.info(f"Обработка: {len(transcripts)} транскриптов, NIM workers: {settings.nim_workers}")
     if progress:
         progress({"log": f"NIM: {len(transcripts)} транскриптов, workers: {settings.nim_workers}"})
-        progress({"phase": "analysis", "weight": weights.get("analysis", weights.get("deepseek", 100))})
+        progress({"phase": "analysis", "weight": weights.get("analysis", 100)})
 
     executor = ThreadPoolExecutor(max_workers=settings.nim_workers)
     tracker = _FragProgress("analysis", REDUCE_FRACTION, progress)

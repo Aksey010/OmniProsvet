@@ -163,6 +163,7 @@ def start():
         "state": "queued", "progress": 0, "lines": [], "current": "",
         "file_index": 0, "file_total": 0, "error": "", "report": None,
         "mode": model, "language": language, "diarize": diarize,
+        "paths": paths,  # Save paths for rerun
     }
     save_job(job_id, job_data)
 
@@ -170,6 +171,44 @@ def start():
         target=run_job, args=(job_id, paths, mode, diarize, model, language), daemon=True
     ).start()
     return jsonify(job_id=job_id)
+
+
+@app.post("/api/rerun/<job_id>")
+def rerun(job_id):
+    """Rerun a job with the same parameters."""
+    old_job = get_job(job_id)
+    if not old_job:
+        return jsonify(error="Задача не найдена"), 404
+    
+    # Extract parameters from old job
+    paths = old_job.get("paths", [])
+    mode = old_job.get("mode", "full")
+    language = old_job.get("language", settings.language)
+    diarize = old_job.get("diarize", True)
+    model = old_job.get("mode", settings.whisper_model)  # model is stored in "mode" field
+    
+    if not paths:
+        return jsonify(error="В исходной задаче нет путей для повторного запуска"), 400
+    
+    # Validate paths still exist
+    existing_paths = [p for p in paths if Path(p).exists()]
+    if not existing_paths:
+        return jsonify(error="Файлы из исходной задачи не найдены на диске"), 400
+    
+    # Create new job with same parameters
+    new_job_id = uuid.uuid4().hex
+    job_data = {
+        "state": "queued", "progress": 0, "lines": [], "current": "",
+        "file_index": 0, "file_total": 0, "error": "", "report": None,
+        "mode": model, "language": language, "diarize": diarize,
+        "paths": existing_paths,
+    }
+    save_job(new_job_id, job_data)
+    
+    threading.Thread(
+        target=run_job, args=(new_job_id, existing_paths, mode, diarize, model, language), daemon=True
+    ).start()
+    return jsonify(job_id=new_job_id)
 
 
 @app.get("/api/status/<job_id>")
@@ -430,9 +469,14 @@ async function loadJobList() {
   if (!r.ok) return;
   const j = await r.json();
   const html = j.jobs.map(job => `
-    <div class="job-item" onclick="showJob('${job.id}')">
-      <div><strong>${job.id.slice(0,8)}</strong> <span class="job-status status-${job.state}">${job.state}</span></div>
+    <div class="job-item">
+      <div onclick="showJob('${job.id}')" style="cursor:pointer">
+        <strong>${job.id.slice(0,8)}</strong> <span class="job-status status-${job.state}">${job.state}</span>
+      </div>
       <div class="job-meta">${job.created_at} • ${job.mode || 'N/A'} • ${job.progress || 0}%</div>
+      ${job.state === 'done' || job.state === 'error' ? `
+        <button class="srcbtn" onclick="event.stopPropagation(); rerunJob('${job.id}')">🔁 Повторить</button>
+      ` : ''}
     </div>
   `).join("");
   $("jobList").innerHTML = html || '<div class="job-meta">Нет задач</div>';
@@ -450,6 +494,23 @@ function showJob(id) {
     if (job.lines && job.lines.length) { $("log").textContent = job.lines.join("\\n"); $("log").scrollTop = 1e9; }
     if (job.state === "done") loadFiles();
   });
+}
+
+async function rerunJob(id) {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = "⏳...";
+  try {
+    const r = await fetch("/api/rerun/" + id, { method: "POST" });
+    const data = await r.json();
+    if (!r.ok) { alert(data.error); btn.disabled = false; btn.textContent = "🔁 Повторить"; return; }
+    // Switch to new job
+    showJob(data.job_id);
+  } catch (e) {
+    alert("Ошибка: " + e.message);
+    btn.disabled = false;
+    btn.textContent = "🔁 Повторить";
+  }
 }
 
 loadJobList();

@@ -9,6 +9,7 @@ from loguru import logger
 
 from src.collect import find_existing_transcript, transcript_path_for
 from src.configuration import settings
+from src.analysis import run_analysis_on_transcripts
 from src.whisper_extract import transcribe_file
 from src.utils import (
     _chunk_lines,
@@ -96,9 +97,13 @@ def run_extract_and_process(
     out_dir: Path | None,
     weights: dict,
     progress=None,
-) -> tuple[list[Path], list[Path]]:
+) -> tuple[list[Path], Path | None]:
+    """
+    Transcribe media files in parallel, then run Map/Reduce analysis on transcripts.
+    Returns (transcripts, report_path).
+    """
     if not media_files:
-        return [], []
+        return [], None
 
     max_workers = min(4, len(media_files))
     logger.info(
@@ -113,6 +118,7 @@ def run_extract_and_process(
     transcripts_order: list[Path] = []
     lock = threading.Lock()
 
+    # Phase 1: Parallel transcription
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(_transcribe_single, mf, model, language, diarize, progress, i, len(media_files)): i
@@ -124,4 +130,17 @@ def run_extract_and_process(
                 with lock:
                     transcripts_order.append(out)
 
-    return transcripts_order, transcripts_order
+    if not transcripts_order:
+        logger.warning("Ни один транскрипт не создан")
+        if progress:
+            progress({"log": "Ни один транскрипт не создан"})
+        return [], None
+
+# Phase 2: Map/Reduce analysis on transcripts
+    logger.info(f"Начинаю анализ {len(transcripts_order)} транскриптов")
+    if progress:
+        progress({"phase": "analysis", "weight": weights.get("analysis", 50)})
+
+    _, report = run_analysis_on_transcripts(transcripts_order, out_dir, weights, progress)
+    
+    return transcripts_order, report

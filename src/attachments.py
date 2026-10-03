@@ -159,10 +159,6 @@ def _merge_pdf_group(pdfs: list[Path]) -> Path | None:
     return out_path
 
 
-logger.info(f"PDF разбит: часть {len(parts)} — страницы {start + 1}-{min(start + max_pages, total_pages)} ({out_path.stat().st_size // 1048576} МБ)")
-    return parts
-
-
 def _process_pdf_as_images(pdf: Path, weights: dict, progress, out_dir: Path | None, quiet: bool) -> list[Path]:
     """Fallback: конвертирует PDF в изображения и обрабатывает через Vision модель."""
     if not PDF2IMAGE_AVAILABLE:
@@ -281,7 +277,7 @@ def _process_single_pdf(pdf: Path, weights: dict, progress, out_dir: Path | None
             executor = ThreadPoolExecutor(max_workers=min(settings.nim_workers, len(chunks)))
             tracker = _FragProgress("pdf", 1.0, progress)
             
-            futures = _submit_fragments(f"{pdf.stem}.pdf", chunks, [nim_client] * min(settings.nim_workers, len(chunks)), executor, tracker, progress)
+            futures = _submit_fragments(f"{pdf.stem}.pdf", chunks, executor, tracker, progress)
             executor.shutdown(wait=True)
             
             texts = [fut.result() for fut in futures]
