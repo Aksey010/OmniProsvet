@@ -57,13 +57,14 @@ class TestChunkHash:
 
 class TestIsSmallChunk:
     def test_small_chunk_detected(self):
-        # Small chunk: half budget, half max_lines
+        # Small chunk: half budget (50 chars << 5000) and few lines (50 << chunk_max_lines/2)
         chunk = ["x"] * 50
-        assert _is_small_chunk(chunk, budget=10000, max_lines=200) is True
+        assert _is_small_chunk(chunk, budget=10000) is True
 
     def test_large_chunk_not_small(self):
+        # size 1_000_000 > budget/2 (5000)
         chunk = ["x" * 5000] * 200
-        assert _is_small_chunk(chunk, budget=10000, max_lines=200) is False
+        assert _is_small_chunk(chunk, budget=10000) is False
 
 
 class TestConfiguration:

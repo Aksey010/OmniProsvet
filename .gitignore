@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Локальные данные и логи
+omniprosvet.log
+data/
+output/
+results/
+transcripts/
+tmp_pdfs/
+uploads/
+
+# Артефакты тестов
+test_result.txt
+smoke_*
+jobs_check*

@@ -154,3 +154,47 @@ def delete_old_jobs(days: int = 7) -> None:
         logger.warning(f"Не удалось удалить старые задачи: {exc}")
     finally:
         conn.close()
+
+
+def mark_interrupted_jobs() -> int:
+    """Помечает задачи в состояниях queued/working как interrupted.
+
+    Вызывается при старте сервера: потоки обработки этих задач умерли
+    вместе с прошлым процессом, поэтому честно показываем пользователю,
+    что задача прервана. Возвращает количество помеченных задач.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(str(get_conn()))
+    marked = 0
+    try:
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='jobs'"
+        )
+        if not cursor.fetchone():
+            return 0
+        conn.execute("PRAGMA journal_mode=WAL")
+        rows = conn.execute("SELECT id, data FROM jobs").fetchall()
+        now = int(time.time())
+        for job_id, data_raw in rows:
+            try:
+                data = json.loads(data_raw)
+            except (ValueError, TypeError):
+                continue
+            if data.get("state") not in ("queued", "working"):
+                continue
+            data["state"] = "interrupted"
+            conn.execute(
+                "UPDATE jobs SET data=?, updated_at=? WHERE id=?",
+                (json.dumps(data, ensure_ascii=False), now, job_id),
+            )
+            marked += 1
+        if marked:
+            conn.commit()
+    except Exception as exc:
+        logger.warning(f"Не удалось пометить прерванные задачи: {exc}")
+    finally:
+        conn.close()
+    if marked:
+        logger.info(f"Помечено как прерванные: {marked} задач(а)")
+    return marked

@@ -10,7 +10,7 @@ from loguru import logger
 
 from src.collect import TRANSCRIPTS_DIR
 from src.configuration import settings
-from src.database import init_db, get_job, save_job, delete_old_jobs
+from src.database import init_db, get_job, save_job, delete_old_jobs, mark_interrupted_jobs
 from src.pipeline import run_pipeline
 
 BASE_DIR = Path(__file__).parent
@@ -38,8 +38,9 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
-# Очистка старых задач при запуске
+# Очистка старых задач и пометка прерванных (их потоки умерли с прошлым процессом)
 delete_old_jobs(days=7)
+mark_interrupted_jobs()
 
 
 class _PhaseProgress:
@@ -322,6 +323,7 @@ PAGE = """<!DOCTYPE html>
   .status-working { background: #fff3e0; color: #e65100; }
   .status-done { background: #e8f5e9; color: #2e7d32; }
   .status-error { background: #ffebee; color: #c62828; }
+  .status-interrupted { background: #eceff1; color: #546e7a; }
 </style>
 </head>
 <body>
@@ -415,6 +417,8 @@ $("go").onclick = async () => {
   jobId = data.job_id;
   $("progress_card").classList.remove("hidden");
   $("downloads").innerHTML = "";
+  const rw = $("resume_wrap");
+  if (rw) rw.remove();
   $("go").disabled = true;
   connectSocket();
 };
@@ -474,8 +478,10 @@ async function loadJobList() {
         <strong>${job.id.slice(0,8)}</strong> <span class="job-status status-${job.state}">${job.state}</span>
       </div>
       <div class="job-meta">${job.created_at} • ${job.mode || 'N/A'} • ${job.progress || 0}%</div>
-      ${job.state === 'done' || job.state === 'error' ? `
-        <button class="srcbtn" onclick="event.stopPropagation(); rerunJob('${job.id}')">🔁 Повторить</button>
+      ${job.state === 'interrupted' ? `
+        <button class="srcbtn" onclick="event.stopPropagation(); rerunJob('${job.id}', this, '▶ Продолжить')">▶ Продолжить</button>
+      ` : (job.state === 'done' || job.state === 'error') ? `
+        <button class="srcbtn" onclick="event.stopPropagation(); rerunJob('${job.id}', this, '🔁 Повторить')">🔁 Повторить</button>
       ` : ''}
     </div>
   `).join("");
@@ -486,30 +492,68 @@ function showJob(id) {
   jobId = id;
   $("progress_card").classList.remove("hidden");
   $("downloads").innerHTML = "";
+  const rw = $("resume_wrap");
+  if (rw) rw.remove();
   $("go").disabled = true;
   connectSocket();
-  // Load existing progress
+  // Load existing progress and restore UI state
   fetch("/api/status/" + id).then(r => r.json()).then(job => {
+    if (!job) { alert("Задача не найдена"); return; }
+    
+    // Restore progress bar
     if (job.progress !== undefined) $("fill").style.width = job.progress + "%";
-    if (job.lines && job.lines.length) { $("log").textContent = job.lines.join("\\n"); $("log").scrollTop = 1e9; }
+    
+    // Restore status text based on state
+    const statusEl = $("status");
+    if (job.state === "queued") {
+      statusEl.textContent = "В очереди…";
+    } else if (job.state === "working") {
+      statusEl.textContent = (job.file_total > 1 ? "Файл " + job.file_index + " из " + job.file_total + ": " : "") + (job.current || "работаю…");
+    } else if (job.state === "done") {
+      statusEl.textContent = "Готово ✔";
+    } else if (job.state === "error") {
+      statusEl.innerHTML = '<span class="err">Ошибка: ' + (job.error || "неизвестная") + "</span>";
+    } else if (job.state === "interrupted") {
+      statusEl.innerHTML = '<span class="err">Прервана (сервер перезапускался) — нажмите «Продолжить»</span>';
+    }
+    
+    // Restore log
+    if (job.lines && job.lines.length) { 
+      $("log").textContent = job.lines.join("\\n"); 
+      $("log").scrollTop = 1e9; 
+    }
+    
+    // Load files if done
     if (job.state === "done") loadFiles();
+
+    // Resume button inside progress card for interrupted jobs
+    const resumeWrap = $("resume_wrap");
+    if (resumeWrap) resumeWrap.remove();
+    if (job.state === "interrupted") {
+      const btn = document.createElement("button");
+      btn.id = "resume_wrap";
+      btn.className = "srcbtn";
+      btn.textContent = "▶ Продолжить задачу";
+      btn.onclick = () => rerunJob(id, btn, "▶ Продолжить задачу");
+      statusEl.after(btn);
+    }
   });
 }
 
-async function rerunJob(id) {
-  const btn = event.target;
+async function rerunJob(id, btn, label) {
+  label = label || "🔁 Повторить";
   btn.disabled = true;
   btn.textContent = "⏳...";
   try {
     const r = await fetch("/api/rerun/" + id, { method: "POST" });
     const data = await r.json();
-    if (!r.ok) { alert(data.error); btn.disabled = false; btn.textContent = "🔁 Повторить"; return; }
+    if (!r.ok) { alert(data.error); btn.disabled = false; btn.textContent = label; return; }
     // Switch to new job
     showJob(data.job_id);
   } catch (e) {
     alert("Ошибка: " + e.message);
     btn.disabled = false;
-    btn.textContent = "🔁 Повторить";
+    btn.textContent = label;
   }
 }
 
