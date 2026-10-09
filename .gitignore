@@ -3,8 +3,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Секреты
+.env
+
 # Локальные данные и логи
-omniprosvet.log
+*.log
 data/
 output/
 results/
@@ -16,3 +19,7 @@ uploads/
 test_result.txt
 smoke_*
 jobs_check*
+
+# Служебные директории инструментов
+.goal/
+.opencode/

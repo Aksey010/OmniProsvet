@@ -52,16 +52,22 @@ def _weights_for(extract: bool, process: bool, att_kinds: list[str]) -> dict:
 def _attachments_worker(att_plan: list, weights: dict, progress, reports: list) -> None:
     """Process all attachment types in parallel."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    
+
     tasks = []
     for kind, files, gdir in att_plan:
         if not files:
             continue
         tasks.append((kind, files, gdir))
-    
+
     if not tasks:
         return
-    
+
+    # Анонсируем фазы с весами здесь: внутренние функции запускаются с quiet=True
+    # и своих анонсов не делают. Так проценты фаз известны с самого старта.
+    if progress:
+        for kind, _, _ in tasks:
+            progress({"phase": kind, "weight": weights.get(kind, 0)})
+
     with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
         futures = {}
         for kind, files, gdir in tasks:
@@ -70,7 +76,7 @@ def _attachments_worker(att_plan: list, weights: dict, progress, reports: list) 
             else:
                 fut = executor.submit(run_attachments, files, kind, weights, gdir, progress, True)
             futures[fut] = kind
-        
+
         for fut in as_completed(futures):
             kind = futures[fut]
             try:
@@ -79,6 +85,10 @@ def _attachments_worker(att_plan: list, weights: dict, progress, reports: list) 
                 logger.error(f"Обработка {kind} упала: {type(exc).__name__}: {exc}")
                 if progress:
                     progress({"log": f"Ошибка обработки {kind}: {exc}"})
+            finally:
+                # Фаза закончилась (успехом или ошибкой) — засчитываем вес целиком
+                if progress:
+                    progress({"phase_done": kind})
 
 
 def run_pipeline(
@@ -150,6 +160,9 @@ def run_pipeline(
                     att_reports += run_attachments(files, kind, weights, gdir, progress)
             except Exception as exc:
                 logger.error(f"Обработка {kind} упала: {type(exc).__name__}: {exc}")
+            finally:
+                if progress:
+                    progress({"phase_done": kind})
 
     transcripts: list[Path] = []
     report = None
@@ -163,10 +176,6 @@ def run_pipeline(
         transcripts, report = run_process_only(media_with_groups, out_dir, weights, progress)
 
     if att_thread is not None:
-        if progress:
-            for kind, files, _ in att_plan:
-                if files:
-                    progress({"phase": kind, "weight": weights.get(kind, 0)})
         att_thread.join()
 
     return {"transcripts": transcripts, "report": report, "image_reports": att_reports}

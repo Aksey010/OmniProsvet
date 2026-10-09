@@ -9,6 +9,7 @@ from loguru import logger
 from src.configuration import settings
 from src.database import get_cached_fragment, save_fragment_cache
 from src.nim_client import NimError, client as nim_client
+from src.outputs import plain_text
 from src.prompts import build_map_prompt, build_reduce_prompt
 from src.utils import (
     _chunk_hash,
@@ -16,6 +17,7 @@ from src.utils import (
     _footer_block,
     _header_block,
     _is_small_chunk,
+    _prepare_transcript,
 )
 
 REDUCE_FRACTION = 0.9
@@ -47,57 +49,26 @@ class _FragProgress:
         self._emit({"p": self._phase, "phase_progress": frac})
 
 
-class _SmallBuffer:
-    def __init__(self, executor: ThreadPoolExecutor, tracker: _FragProgress, progress) -> None:
-        self.lines: list[str] = []
-        self.size = 0
-        self.futures: list = []
-        self.executor = executor
-        self.tracker = tracker
-        self.progress = progress
-
-    def add_chunk(self, name: str, chunk: list[str]) -> None:
-        need = sum(len(line) for line in chunk)
-        if self.lines and (
-            self.size + need > settings.chunk_char_budget
-            or len(self.lines) + len(chunk) > settings.chunk_max_lines
-        ):
-            self.flush()
-        if self.progress:
-            self.progress({"log": f"«{name}» — мелкий, копится в общий батч"})
-        self.lines += chunk
-        self.size += need
-
-    def flush(self) -> None:
-        if not self.lines:
-            return
-        chunk = self.lines
-        self.lines = []
-        self.size = 0
-        self.tracker.add_total(1)
-        fut = self.executor.submit(
-            _process_fragment, 1, 1, chunk, "мелкие файлы", self.progress
-        )
-        fut.add_done_callback(self.tracker.tick)
-        self.futures.append(fut)
-
-
 def _process_fragment(idx: int, total: int, chunk: list[str], source: str, progress) -> str:
     body = "\n".join(chunk)
     h = _chunk_hash(source, chunk)
     cached = get_cached_fragment(h)
     if cached:
+        # Старый кэш мог быть записан с markdown-разметкой — приводим к plain text
+        text = plain_text(cached)
         logger.info(f"Конспект фрагмента {idx}/{total} «{source}» — из кэша")
         if progress:
             progress({"log": f"Фрагмент {idx}/{total} «{source}» — из кэша"})
-        return cached
+        return text
     if progress:
         progress({"log": f"Фрагмент {idx}/{total} «{source}» — отправляю в NIM…"})
-    text = nim_client.send_prompt(
-        build_map_prompt(idx, total, source, body),
-        deepthink=False,
-        expert=False,
-        stable_rounds=6,
+    text = plain_text(
+        nim_client.send_prompt(
+            build_map_prompt(idx, total, source, body),
+            deepthink=False,
+            expert=False,
+            stable_rounds=6,
+        )
     )
     save_fragment_cache(h, source, text)
     logger.info(f"Конспект фрагмента {idx}/{total} «{source}» готов ({len(text)} симв.)")
@@ -110,8 +81,15 @@ def _submit_fragments(
     executor: ThreadPoolExecutor,
     tracker: _FragProgress,
     progress,
+    add_total: bool = True,
 ) -> list:
-    tracker.add_total(len(chunks))
+    """Засабмитить чанки источника в пул.
+
+    add_total=False — когда суммарный знаменатель уже посчитан заранее
+    (two-pass планирование в _run_analysis_on_transcripts).
+    """
+    if add_total:
+        tracker.add_total(len(chunks))
     futures = []
     for i, chunk in enumerate(chunks):
         fut = executor.submit(_process_fragment, i + 1, len(chunks), chunk, name, progress)
@@ -120,31 +98,47 @@ def _submit_fragments(
     return futures
 
 
-def _collect_results(futures_map: dict[str, list], transcripts_order: list[Path]) -> list:
-    all_futures: list = []
-    for t in transcripts_order:
-        all_futures += futures_map.get(str(t), [])
-    all_futures += futures_map.get("мелкие файлы", [])
-    return all_futures
-
-
-def _feed_transcript(
-    transcript: Path,
-    futures_map: dict[str, list],
-    executor: ThreadPoolExecutor,
-    small_buffer: _SmallBuffer,
-    tracker: _FragProgress,
-    progress,
+def _plan_fragments(
+    transcripts: list[Path],
     budget: int | None = None,
-) -> None:
-    prepared = _prepare_transcript(transcript, budget)
-    if prepared is None:
-        return
-    source, chunks = prepared
-    if len(chunks) == 1 and _is_small_chunk(chunks[0], budget):
-        small_buffer.add_chunk(source, chunks[0])
-        return
-    futures_map[str(transcript)] = _submit_fragments(source, chunks, executor, tracker, progress)
+    progress=None,
+) -> list[tuple[str, list[list[str]]]]:
+    """Спроектировать все фрагменты заранее (первый проход two-pass).
+
+    Чтение транскриптов и чанкинг дешёвые, поэтому считаем их до старта
+    NIM-запросов: суммарное число фрагментов известно до первого «тика»
+    прогресса, и знаменатель не растёт на глазах у пользователя.
+
+    Мелкие одиночные чанки склеиваются в общие батчи «мелкие файлы» —
+    так же, как раньше делал _SmallBuffer.
+    """
+    units: list[tuple[str, list[list[str]]]] = []
+    small_lines: list[str] = []
+    small_size = 0
+    for t in transcripts:
+        prepared = _prepare_transcript(t, budget)
+        if prepared is None:
+            continue
+        source, chunks = prepared
+        if len(chunks) == 1 and _is_small_chunk(chunks[0], budget):
+            if progress:
+                progress({"log": f"«{source}» — мелкий, копится в общий батч"})
+            chunk = chunks[0]
+            need = sum(len(line) for line in chunk)
+            if small_lines and (
+                small_size + need > settings.chunk_char_budget
+                or len(small_lines) + len(chunk) > settings.chunk_max_lines
+            ):
+                units.append(("мелкие файлы", [small_lines]))
+                small_lines = []
+                small_size = 0
+            small_lines += chunk
+            small_size += need
+        else:
+            units.append((source, chunks))
+    if small_lines:
+        units.append(("мелкие файлы", [small_lines]))
+    return units
 
 
 def _reduce_and_save(
@@ -158,12 +152,14 @@ def _reduce_and_save(
         progress({"p": "analysis", "phase_progress": 0.95})
     parts = [fut.result() for fut in all_futures]
     parts_block = "\n\n".join(f"### Фрагмент {i}\n{p}" for i, p in enumerate(parts, 1))
-    final = nim_client.send_prompt(
-        build_reduce_prompt(len(transcripts_order), len(all_futures), parts_block),
-        deepthink=settings.nim_workers > 1,
-        expert=settings.nim_workers > 1,
-        stable_rounds=6,
-        model=settings.nim_reduce_model,
+    final = plain_text(
+        nim_client.send_prompt(
+            build_reduce_prompt(len(transcripts_order), len(all_futures), parts_block),
+            deepthink=settings.nim_workers > 1,
+            expert=settings.nim_workers > 1,
+            stable_rounds=6,
+            model=settings.nim_reduce_model,
+        )
     )
     target_dir = out_dir or settings.output_dir
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -232,20 +228,33 @@ def _run_analysis_on_transcripts(
         progress({"log": f"NIM: {len(transcripts)} транскриптов, workers: {settings.nim_workers}"})
         progress({"phase": "analysis", "weight": weights.get("analysis", 100)})
 
+    budget = settings.nim_chunk_char_budget
+
+    # Two-pass: сначала дешёвый проход по файлам — чтение и чанкинг.
+    # Знаменатель прогресса фиксируется до первого NIM-запроса.
+    units = _plan_fragments(transcripts, budget, progress)
+    total_fragments = sum(len(chunks) for _, chunks in units)
+    if total_fragments == 0:
+        logger.warning("В транскриптах нет распознанного текста")
+        if progress:
+            progress({"phase_done": "analysis"})
+        return transcripts, None
+
     executor = ThreadPoolExecutor(max_workers=settings.nim_workers)
     tracker = _FragProgress("analysis", REDUCE_FRACTION, progress)
-    budget = settings.nim_chunk_char_budget
-    futures_map: dict[str, list] = {}
-    small_buffer = _SmallBuffer(executor, tracker, progress)
-    for t in transcripts:
-        _feed_transcript(t, futures_map, executor, small_buffer, tracker, progress, budget)
-    small_buffer.flush()
-    futures_map["мелкие файлы"] = small_buffer.futures
+    tracker.add_total(total_fragments)
+
+    all_futures: list = []
+    for source, chunks in units:
+        all_futures += _submit_fragments(source, chunks, executor, tracker, progress, add_total=False)
     executor.shutdown(wait=True)
 
-    all_futures = _collect_results(futures_map, transcripts)
     if not all_futures:
         logger.warning("В транскриптах нет распознанного текста")
+        if progress:
+            progress({"phase_done": "analysis"})
         return transcripts, None
     report = _reduce_and_save(transcripts, all_futures, out_dir, progress)
+    if progress:
+        progress({"phase_done": "analysis"})
     return transcripts, report

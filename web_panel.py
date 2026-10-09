@@ -1,3 +1,4 @@
+import io
 import threading
 import time
 import uuid
@@ -8,9 +9,10 @@ from flask import Flask, jsonify, render_template_string, request, send_file
 from flask_socketio import SocketIO, emit
 from loguru import logger
 
-from src.collect import TRANSCRIPTS_DIR
 from src.configuration import settings
 from src.database import init_db, get_job, save_job, delete_old_jobs, mark_interrupted_jobs
+from src.outputs import build_zip_bytes, collect_job_files
+from src.progress import PhaseProgress
 from src.pipeline import run_pipeline
 
 BASE_DIR = Path(__file__).parent
@@ -43,35 +45,11 @@ delete_old_jobs(days=7)
 mark_interrupted_jobs()
 
 
-class _PhaseProgress:
-    def __init__(self) -> None:
-        self.current: str | None = None
-        self.completed = 0.0
-        self.weights: dict = {}
-        self.fracs: dict = {}
-
-    def feed(self, event: dict) -> None:
-        if "phase" in event:
-            name = event["phase"]
-            if name != self.current:
-                if self.current is not None:
-                    self.completed += self.weights.get(self.current, 0)
-                self.current = name
-            self.weights[name] = event.get("weight", 0)
-        elif "phase_progress" in event:
-            self.fracs[event.get("p")] = max(0.0, min(1.0, event["phase_progress"]))
-
-    def percent(self) -> int:
-        frac = self.fracs.get(self.current, 0.0)
-        weight = self.weights.get(self.current, 0)
-        return min(100, round(self.completed + frac * weight))
-
-
 def run_job(job_id: str, paths: list[str], mode: str, diarize: bool, model: str, language: str) -> None:
     job = get_job(job_id)
     if not job:
         return
-    pp = _PhaseProgress()
+    pp = PhaseProgress()
 
     def progress(event: dict) -> None:
         if "log" in event:
@@ -80,7 +58,9 @@ def run_job(job_id: str, paths: list[str], mode: str, diarize: bool, model: str,
             save_job(job_id, job)
             return
         pp.feed(event)
-        job["progress"] = pp.percent()
+        pct = pp.percent()
+        if pct > job.get("progress", 0):
+            job["progress"] = pct
         if "file" in event:
             job["current"] = event["file"]
             if event.get("file_index"):
@@ -110,6 +90,7 @@ def run_job(job_id: str, paths: list[str], mode: str, diarize: bool, model: str,
         )
         job["state"] = "done"
         job["progress"] = 100
+        job["files"] = collect_job_files(result)
         if result["report"]:
             job["report"] = str(result["report"])
         job["lines"].append(
@@ -222,16 +203,29 @@ def status(job_id):
 
 @app.get("/api/files/<job_id>")
 def files_list(job_id):
+    """Только файлы, созданные этой задачей (не все файлы за всё время)."""
     job = get_job(job_id)
     if not job:
         return jsonify(error="Задача не найдена"), 404
-    out = []
-    for d in (UPLOADS_DIR / job_id, OUTPUT_DIR, TRANSCRIPTS_DIR, RESULTS_DIR):
-        if not d.exists():
-            continue
-        for f in sorted(d.rglob("*.txt")):
-            out.append({"name": f.name, "path": str(f), "dir": str(f.parent.relative_to(BASE_DIR))})
-    return jsonify(files=out)
+    return jsonify(files=job.get("files") or [])
+
+
+@app.get("/api/zip/<job_id>")
+def zip_archive(job_id):
+    """Все выходные файлы задачи одним ZIP-архивом."""
+    job = get_job(job_id)
+    if not job:
+        return jsonify(error="Задача не найдена"), 404
+    files = job.get("files") or []
+    if not files:
+        return "Файлы этой задачи не записаны", 404
+    data = build_zip_bytes(files)
+    return send_file(
+        io.BytesIO(data),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"omniprosvet_{job_id[:8]}.zip",
+    )
 
 
 @app.get("/api/result/<job_id>")
@@ -314,6 +308,9 @@ PAGE = """<!DOCTYPE html>
   .chk { font-size: 14px; color: #333; margin-top: 12px; display: flex; align-items: center; gap: 8px; }
   .hint { font-size: 12px; color: #777; margin-top: 8px; }
   a.dl { display: inline-block; margin-top: 8px; margin-right: 14px; color: #1565c0; font-size: 14px; }
+  a.dl.zip { font-size: 16px; font-weight: 600; padding: 10px 18px; background: #e3f2fd;
+             border-radius: 8px; text-decoration: none; margin-bottom: 10px; }
+  a.dl.zip:hover { background: #bbdefb; }
   .job-item { padding: 10px; border-bottom: 1px solid #eee; cursor: pointer; }
   .job-item:hover { background: #f5f5f5; }
   .job-item:last-child { border-bottom: none; }
@@ -463,9 +460,15 @@ async function loadFiles() {
   const r = await fetch("/api/files/" + jobId);
   if (!r.ok) return;
   const j = await r.json();
-  const parts = j.files.map(f =>
-    '<a class="dl" href="/api/download?path=' + encodeURIComponent(f.path) + '">⬇ ' + f.name + "</a>");
-  if (parts.length) $("downloads").innerHTML = parts.join("<br>");
+  const files = j.files || [];
+  if (!files.length) {
+    $("downloads").innerHTML = '<div class="job-meta">Файлы этой задачи не записаны</div>';
+    return;
+  }
+  const zipBtn = '<a class="dl zip" href="/api/zip/' + jobId + '">&#128230; Скачать всё одним архивом (ZIP)</a>';
+  const parts = files.map(f =>
+    '<a class="dl" href="/api/download?path=' + encodeURIComponent(f.path) + '">&#11015; ' + f.name + "</a>");
+  $("downloads").innerHTML = zipBtn + "<br>" + parts.join("<br>");
 }
 
 async function loadJobList() {

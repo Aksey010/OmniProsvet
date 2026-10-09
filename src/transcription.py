@@ -1,27 +1,15 @@
-import hashlib
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from queue import Queue
 
 from loguru import logger
 
-from src.collect import find_existing_transcript, transcript_path_for
-from src.configuration import settings
 from src.analysis import run_analysis_on_transcripts
+from src.progress import FilesProgress
 from src.whisper_extract import transcribe_file
-from src.utils import (
-    _chunk_lines,
-    _footer_block,
-    _header_block,
-    _is_small_chunk,
-    _prepare_transcript,
-    _transcript_source_label,
-)
 
 
-def _transcribe_single(media_file: tuple[Path, Path], model: str, language: str, diarize: bool, progress, idx: int, total: int) -> Path | None:
+def _transcribe_single(media_file: tuple[Path, Path], model: str, language: str, diarize: bool, progress, on_progress, idx: int, total: int) -> Path | None:
     """Transcribe a single file with progress reporting."""
     f, gdir = media_file
     if progress:
@@ -32,13 +20,7 @@ def _transcribe_single(media_file: tuple[Path, Path], model: str, language: str,
             model,
             language,
             diarize=diarize,
-            on_progress=(
-                lambda pct, _i=idx, _t=total: progress(
-                    {"p": "transcribe", "phase_progress": (_i - 1 + pct / 100) / _t}
-                )
-            )
-            if progress
-            else None,
+            on_progress=on_progress,
             group_dir=gdir,
         )
         if progress:
@@ -75,16 +57,25 @@ def run_extract(
 
     results: list[Path] = []
     total = len(media_files)
+    files_progress = FilesProgress(total, "transcribe")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(_transcribe_single, mf, model, language, diarize, progress, i, total): i
+            executor.submit(
+                _transcribe_single,
+                mf, model, language, diarize,
+                progress, files_progress.reporter(i, progress) if progress else None,
+                i, total,
+            ): i
             for i, mf in enumerate(media_files, 1)
         }
         for fut in as_completed(futures):
             out = fut.result()
             if out:
                 results.append(out)
+
+    if progress:
+        progress({"phase_done": "transcribe"})
 
     return results
 
@@ -119,9 +110,15 @@ def run_extract_and_process(
     lock = threading.Lock()
 
     # Phase 1: Parallel transcription
+    files_progress = FilesProgress(len(media_files), "transcribe")
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(_transcribe_single, mf, model, language, diarize, progress, i, len(media_files)): i
+            executor.submit(
+                _transcribe_single,
+                mf, model, language, diarize,
+                progress, files_progress.reporter(i, progress) if progress else None,
+                i, len(media_files),
+            ): i
             for i, mf in enumerate(media_files, 1)
         }
         for fut in as_completed(futures):
@@ -129,6 +126,9 @@ def run_extract_and_process(
             if out:
                 with lock:
                     transcripts_order.append(out)
+
+    if progress:
+        progress({"phase_done": "transcribe"})
 
     if not transcripts_order:
         logger.warning("Ни один транскрипт не создан")

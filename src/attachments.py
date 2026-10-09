@@ -4,11 +4,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from loguru import logger
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader
 
 from src.configuration import settings
 from src.database import get_cached_fragment, save_fragment_cache
 from src.nim_client import NimError, client as nim_client
+from src.outputs import plain_text
 from src.prompts import build_documents_prompt, build_images_prompt
 from src.utils import _chunk_lines, _footer_block, _header_block
 from src.analysis import _FragProgress, _process_fragment, _submit_fragments
@@ -52,14 +53,18 @@ def _process_attachment_batch(batch: list[Path], kind: str, out_dir: Path | None
     text = get_cached_fragment(h)
     if not text:
         prompt = build_images_prompt(len(batch)) if kind == "images" else build_documents_prompt(len(batch))
-        text = nim_client.send_prompt(
-            prompt,
-            deepthink=False,
-            expert=False,
-            stable_rounds=6,
-            attachments=[str(p.resolve()) for p in batch],
+        text = plain_text(
+            nim_client.send_prompt(
+                prompt,
+                deepthink=False,
+                expert=False,
+                stable_rounds=6,
+                attachments=[str(p.resolve()) for p in batch],
+            )
         )
         save_fragment_cache(h, kind, text)
+    else:
+        text = plain_text(text)  # старый кэш мог быть с markdown-разметкой
     target_dir = out_dir or settings.results_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     out_path = target_dir / f"{batch[0].stem}_{h[:8]}.{kind}.txt"
@@ -113,52 +118,6 @@ def run_attachments(files: list[Path], kind: str, weights: dict, out_dir: Path |
     return results
 
 
-PDF_MERGE_DIR = Path(__file__).resolve().parent.parent / "tmp_pdfs"
-
-
-def _pdf_groups(pdfs: list[Path]) -> list[list[Path]]:
-    budget = settings.pdf_max_size_mb * 1024 * 1024
-    groups: list[list[Path]] = []
-    current: list[Path] = []
-    size = 0
-    for pdf in pdfs:
-        psz = pdf.stat().st_size
-        if current and size + psz > budget:
-            groups.append(current)
-            current = []
-            size = 0
-        current.append(pdf)
-        size += psz
-    if current:
-        groups.append(current)
-    return groups
-
-
-def _merge_pdf_group(pdfs: list[Path]) -> Path | None:
-    key = "|".join(f"{p.name}:{p.stat().st_size}" for p in pdfs)
-    h = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    out_path = PDF_MERGE_DIR / f"{h[:8]}.pdf"
-    if out_path.exists():
-        return out_path
-    PDF_MERGE_DIR.mkdir(parents=True, exist_ok=True)
-
-    writer = PdfWriter()
-    for pdf in pdfs:
-        try:
-            reader = PdfReader(str(pdf))
-            for page in reader.pages:
-                writer.add_page(page)
-        except Exception as exc:
-            logger.warning(f"PDF {pdf.name} пропущен при склейке (не читается: {type(exc).__name__}: {exc})")
-    if len(writer.pages) == 0:
-        logger.error(f"Ни один PDF из группы не склеился ({len(pdfs)} шт.)")
-        return None
-    with open(out_path, "wb") as f:
-        writer.write(f)
-    logger.info(f"PDF склеены: {len(pdfs)} шт. → {out_path.name} ({out_path.stat().st_size // 1048576} МБ)")
-    return out_path
-
-
 def _process_pdf_as_images(pdf: Path, weights: dict, progress, out_dir: Path | None, quiet: bool) -> list[Path]:
     """Fallback: конвертирует PDF в изображения и обрабатывает через Vision модель."""
     if not PDF2IMAGE_AVAILABLE:
@@ -200,17 +159,21 @@ def _process_pdf_as_images(pdf: Path, weights: dict, progress, out_dir: Path | N
             key = "|".join(f"{p.name}:{p.stat().st_size}" for p in batch)
             h = hashlib.sha256(key.encode("utf-8")).hexdigest()
             text = get_cached_fragment(h)
-            
+
             if not text:
                 prompt = build_images_prompt(len(batch))
-                text = nim_client.send_prompt(
-                    prompt,
-                    deepthink=False,
-                    expert=False,
-                    stable_rounds=6,
-                    attachments=[str(p.resolve()) for p in batch],
+                text = plain_text(
+                    nim_client.send_prompt(
+                        prompt,
+                        deepthink=False,
+                        expert=False,
+                        stable_rounds=6,
+                        attachments=[str(p.resolve()) for p in batch],
+                    )
                 )
                 save_fragment_cache(h, "pdf_scan", text)
+            else:
+                text = plain_text(text)  # старый кэш мог быть с markdown-разметкой
             
             # Сохраняем результат батча
             target_dir = out_dir or settings.results_dir
@@ -264,25 +227,27 @@ def _process_single_pdf(pdf: Path, weights: dict, progress, out_dir: Path | None
         # Check cache
         h = hashlib.sha256(f"{pdf.stem}.pdf|{pdf.stat().st_size}".encode("utf-8")).hexdigest()
         text = get_cached_fragment(h)
-        
+
         if not text:
             budget = settings.nim_chunk_char_budget
             chunks = _chunk_lines(lines, budget)
             if not chunks:
                 return []
-            
+
             from concurrent.futures import ThreadPoolExecutor
-            from src.analysis import _FragProgress, _process_fragment, _submit_fragments, _collect_results
-            
+            from src.analysis import _FragProgress, _process_fragment, _submit_fragments
+
             executor = ThreadPoolExecutor(max_workers=min(settings.nim_workers, len(chunks)))
             tracker = _FragProgress("pdf", 1.0, progress)
-            
+
             futures = _submit_fragments(f"{pdf.stem}.pdf", chunks, executor, tracker, progress)
             executor.shutdown(wait=True)
-            
+
             texts = [fut.result() for fut in futures]
             text = "\n\n".join(texts)
             save_fragment_cache(h, "pdf", text)
+        else:
+            text = plain_text(text)  # старый кэш мог быть с markdown-разметкой
         
         target_dir = out_dir or settings.results_dir
         target_dir.mkdir(parents=True, exist_ok=True)

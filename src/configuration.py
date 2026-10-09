@@ -37,7 +37,6 @@ class Settings:
     chunk_char_budget: int = _as_int("CHUNK_CHAR_BUDGET", 65000)
     chunk_max_lines: int = _as_int("CHUNK_MAX_LINES", 300)
     images_per_batch: int = _as_int("IMAGES_PER_BATCH", 25)
-    pdf_max_size_mb: int = _as_int("PDF_MAX_SIZE_MB", 40)
 
     # NVIDIA NIM API (бесплатный ключ с build.nvidia.com)
     nim_api_key: str = os.getenv("NIM_API_KEY", "")
@@ -60,7 +59,6 @@ class Settings:
     transcripts_dir: Path = base_dir / "transcripts"
     results_dir: Path = base_dir / "results"
     tmp_pdfs_dir: Path = base_dir / "tmp_pdfs"
-    browser_profile_dir: Path = data_dir / "browser-profile"
     cache_db_path: Path = data_dir / "cache.db"
 
     def validate(self) -> list[str]:
