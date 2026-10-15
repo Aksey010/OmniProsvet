@@ -1,19 +1,22 @@
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from loguru import logger
 
 from src.analysis import run_analysis_on_transcripts
+from src.configuration import settings
 from src.progress import FilesProgress
 from src.whisper_extract import transcribe_file
 
 
-def _transcribe_single(media_file: tuple[Path, Path], model: str, language: str, diarize: bool, progress, on_progress, idx: int, total: int) -> Path | None:
+def _transcribe_single(media_file: tuple[Path, Path], model: str, language: str, diarize: bool, progress, on_progress) -> Path | None:
     """Transcribe a single file with progress reporting."""
     f, gdir = media_file
     if progress:
-        progress({"file": f.name, "file_index": idx, "file_total": total})
+        # Событие старта: только имя, без счётчика — индекс присваивается
+        # по факту ЗАВЕРШЕНИЯ файла, чтобы «Файл n из N» не скакал между
+        # параллельными воркерами.
+        progress({"file": f.name, "phase": "transcribe"})
     try:
         out = transcribe_file(
             f,
@@ -45,7 +48,7 @@ def run_extract(
     if not media_files:
         return []
     
-    max_workers = max_workers or min(4, len(media_files))
+    max_workers = max_workers or min(settings.whisper_workers, len(media_files))
     logger.info(
         f"Транскрибация: {len(media_files)} файлов, модель {model}, "
         f"язык {language}, диаризация: {'вкл' if diarize else 'выкл'}, "
@@ -65,14 +68,21 @@ def run_extract(
                 _transcribe_single,
                 mf, model, language, diarize,
                 progress, files_progress.reporter(i, progress) if progress else None,
-                i, total,
             ): i
             for i, mf in enumerate(media_files, 1)
         }
+        done = 0
         for fut in as_completed(futures):
+            i = futures[fut]
             out = fut.result()
             if out:
                 results.append(out)
+            # Счётчик n из N — по числу файлов с ЗАВЕРШЁННОЙ обработкой
+            # (успех или ошибка): монотонный, не зависит от порядка воркеров.
+            done += 1
+            if progress:
+                name = out.name if out else media_files[i - 1][0].name
+                progress({"file": name, "file_index": done, "file_total": total, "phase": "transcribe"})
 
     if progress:
         progress({"phase_done": "transcribe"})
@@ -96,7 +106,7 @@ def run_extract_and_process(
     if not media_files:
         return [], None
 
-    max_workers = min(4, len(media_files))
+    max_workers = min(settings.whisper_workers, len(media_files))
     logger.info(
         f"Транскрибация + обработка: {len(media_files)} файлов, модель {model}, "
         f"язык {language}, диаризация: {'вкл' if diarize else 'выкл'}, "
@@ -107,25 +117,30 @@ def run_extract_and_process(
         progress({"phase": "transcribe", "weight": weights.get("transcribe", 50)})
 
     transcripts_order: list[Path] = []
-    lock = threading.Lock()
+    total = len(media_files)
 
     # Phase 1: Parallel transcription
-    files_progress = FilesProgress(len(media_files), "transcribe")
+    files_progress = FilesProgress(total, "transcribe")
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
                 _transcribe_single,
                 mf, model, language, diarize,
                 progress, files_progress.reporter(i, progress) if progress else None,
-                i, len(media_files),
             ): i
             for i, mf in enumerate(media_files, 1)
         }
+        done = 0
         for fut in as_completed(futures):
+            i = futures[fut]
             out = fut.result()
             if out:
-                with lock:
-                    transcripts_order.append(out)
+                transcripts_order.append(out)
+            # Монотонный счётчик завершённых файлов — как в run_extract
+            done += 1
+            if progress:
+                name = out.name if out else media_files[i - 1][0].name
+                progress({"file": name, "file_index": done, "file_total": total, "phase": "transcribe"})
 
     if progress:
         progress({"phase_done": "transcribe"})

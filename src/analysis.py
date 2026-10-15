@@ -1,7 +1,7 @@
 import hashlib
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from loguru import logger
@@ -21,6 +21,20 @@ from src.utils import (
 )
 
 REDUCE_FRACTION = 0.9
+
+# Промежуточная сводка группы конспектов (иерархический reduce).
+# Включается, когда фрагментов больше NIM_REDUCE_GROUP_SIZE: группа конспектов
+# сжимается параллельно, финальный reduce получает компактный вход — выход
+# каждого запроса ограничен, вероятность упереться в max_tokens падает.
+INTERMEDIATE_REDUCE_PROMPT = (
+    "Ниже — конспекты фрагментов {first}-{last} одного массива материалов.\n"
+    "Сведь их в один компактный промежуточный конспект:\n"
+    "- дедуплицируй повторяющиеся события, контакты и ссылки (каждый факт — один раз);\n"
+    "- сохрани все датированные факты: даты, числа и суммы, имена, названия, ссылки;\n"
+    "- разделяй датированные события и нематериальные обсуждения;\n"
+    "- пиши по-русски, обычным текстом без markdown, объём — не более 3000 символов.\n\n"
+    "# Конспекты фрагментов\n{parts}\n\nПромежуточный конспект:"
+)
 
 
 class _FragProgress:
@@ -49,6 +63,15 @@ class _FragProgress:
         self._emit({"p": self._phase, "phase_progress": frac})
 
 
+# Подставка вместо неполученного конспекта: финальный reduce видит пропуск
+# честно, а весь многочасовой анализ не умирает из-за одного сбоя NIM.
+FRAGMENT_FAILED_TEMPLATE = "(Фрагмент {idx} из «{source}» не обработан: ошибка NIM — {reason})"
+
+
+def _failed_fragment_note(idx: int, source: str, reason: str) -> str:
+    return FRAGMENT_FAILED_TEMPLATE.format(idx=idx, source=source, reason=reason)
+
+
 def _process_fragment(idx: int, total: int, chunk: list[str], source: str, progress) -> str:
     body = "\n".join(chunk)
     h = _chunk_hash(source, chunk)
@@ -62,17 +85,39 @@ def _process_fragment(idx: int, total: int, chunk: list[str], source: str, progr
         return text
     if progress:
         progress({"log": f"Фрагмент {idx}/{total} «{source}» — отправляю в NIM…"})
-    text = plain_text(
-        nim_client.send_prompt(
-            build_map_prompt(idx, total, source, body),
-            deepthink=False,
-            expert=False,
-            stable_rounds=6,
+    try:
+        text = plain_text(
+            nim_client.send_prompt(
+                build_map_prompt(idx, total, source, body),
+                deepthink=False,
+                expert=False,
+                stable_rounds=6,
+            )
         )
-    )
+    except NimError as exc:
+        # В сессии 13–14.10 один ReadTimeout здесь убивал весь анализ
+        # (задача e72938ef: сотни файлов — в мусор из-за одного фрагмента).
+        # Теперь фрагмент честно помечается пропущенным, анализ продолжается.
+        logger.error(f"Фрагмент {idx}/{total} «{source}» не обработан: {exc}")
+        if progress:
+            progress({"log": f"Ошибка фрагмента {idx}/{total} «{source}» — пропущен ({exc})"})
+        return _failed_fragment_note(idx, source, str(exc)[:200])
     save_fragment_cache(h, source, text)
     logger.info(f"Конспект фрагмента {idx}/{total} «{source}» готов ({len(text)} симв.)")
     return text
+
+
+def _result_or_failed_note(fut, idx: int, total: int, source: str) -> str:
+    """Результат будущего фрагмента; любой сбой — заметка-подставка.
+
+    Страховка вокруг _process_fragment (там ловится NimError): неожиданные
+    исключения тоже не должны убивать сборку отчёта.
+    """
+    try:
+        return fut.result()
+    except Exception as exc:  # noqa: BLE001 — страховка всей фазы
+        logger.error(f"Фрагмент {idx}/{total} «{source}» упал: {type(exc).__name__}: {exc}")
+        return _failed_fragment_note(idx, source, f"{type(exc).__name__}: {exc}"[:200])
 
 
 def _submit_fragments(
@@ -141,6 +186,111 @@ def _plan_fragments(
     return units
 
 
+def _intermediate_group_summaries(
+    parts: list[str],
+    group_size: int,
+    progress,
+) -> list[str]:
+    """Параллельно сжать конспекты фрагментов группами (иерархический reduce).
+
+    Возвращает список промежуточных сводок — по одной на группу.
+    """
+    groups = [parts[i:i + group_size] for i in range(0, len(parts), group_size)]
+    logger.info(f"Иерархический reduce: {len(parts)} конспектов -> {len(groups)} групп (по {group_size})")
+    if progress:
+        progress({"log": f"Сборка отчёта: {len(groups)} промежуточных сводок (по {group_size} фрагментов)…"})
+
+    def _summarize_group(start_index: int, group: list[str]) -> str:
+        block = "\n\n".join(f"### Фрагмент {j}\n{p}" for j, p in enumerate(group, 1))
+        prompt = INTERMEDIATE_REDUCE_PROMPT.format(
+            first=start_index, last=start_index + len(group) - 1, parts=block
+        )
+        return plain_text(
+            nim_client.send_prompt(
+                prompt,
+                deepthink=False,
+                expert=False,
+                stable_rounds=6,
+            )
+        )
+
+    summaries: list[str | None] = [None] * len(groups)
+    starts = [i * group_size + 1 for i in range(len(groups))]
+    span = 0.95 - REDUCE_FRACTION
+    done = 0
+    with ThreadPoolExecutor(max_workers=min(settings.nim_workers, len(groups))) as executor:
+        futures = {
+            executor.submit(_summarize_group, starts[gi], group): gi
+            for gi, group in enumerate(groups)
+        }
+        for fut in as_completed(futures):
+            gi = futures[fut]
+            try:
+                summaries[gi] = fut.result()
+            except NimError as exc:
+                # Точка падения задачи e72938ef (14.10 01:27): один ReadTimeout
+                # в промежуточной сводке убивал весь анализ. Группа помечается
+                # пропущенной — финальный reduce получает отчёт с пробелом.
+                first, last = starts[gi], starts[gi] + len(groups[gi]) - 1
+                logger.error(f"Промежуточная сводка фрагментов {first}-{last} не удалась: {exc}")
+                if progress:
+                    progress({"log": f"Промежуточная сводка {first}-{last} не удалась — пропускаю ({exc})"})
+                summaries[gi] = _failed_fragment_note(first, f"группа фрагментов {first}-{last}", str(exc)[:200])
+            except Exception as exc:  # noqa: BLE001 — неожиданное тоже не роняет фазу
+                first, last = starts[gi], starts[gi] + len(groups[gi]) - 1
+                logger.error(f"Промежуточная сводка {first}-{last} упала: {type(exc).__name__}: {exc}")
+                summaries[gi] = _failed_fragment_note(first, f"группа фрагментов {first}-{last}", f"{type(exc).__name__}: {exc}"[:200])
+            done += 1
+            if progress:
+                # Строго ниже 0.95: финальный reduce эмитит ровно 0.95 (монотонность)
+                progress({"p": "analysis", "phase_progress": REDUCE_FRACTION + span * done / (len(groups) + 1)})
+    return [s for s in summaries if s is not None]
+
+
+def _final_reduce_with_fallback(parts_block: str, n_transcripts: int, total_fragments: int) -> str:
+    """Финальный reduce с fallback-моделью; обе мертвы — частичный отчёт.
+
+    Возвращает текст отчёта в любом случае: либо сводка, либо сырые
+    промежуточные части с пометкой, что финальная сводка не удалась.
+    Анализ обязан доводиться до файла-отчёта при любых ошибках NIM.
+    """
+    try:
+        return plain_text(
+            nim_client.send_prompt(
+                build_reduce_prompt(n_transcripts, total_fragments, parts_block),
+                deepthink=settings.nim_workers > 1,
+                expert=settings.nim_workers > 1,
+                stable_rounds=6,
+                model=settings.nim_reduce_model,
+            )
+        )
+    except NimError as exc:
+        logger.warning(f"Финальный reduce моделью {settings.nim_reduce_model} не удался: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Финальный reduce упал: {type(exc).__name__}: {exc}")
+
+    fallback_model = settings.nim_model
+    if fallback_model and fallback_model != settings.nim_reduce_model:
+        try:
+            logger.warning(f"Повтор финального reduce моделью {fallback_model}…")
+            return plain_text(
+                nim_client.send_prompt(
+                    build_reduce_prompt(n_transcripts, total_fragments, parts_block),
+                    deepthink=False,
+                    expert=False,
+                    stable_rounds=6,
+                    model=fallback_model,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Финальный reduce моделью {fallback_model} тоже не удался: {exc}")
+
+    return (
+        "ФИНАЛЬНАЯ СВОДКА НЕ УДАЛАСЬ (ошибка NIM после повторов) — ниже "
+        "промежуточные конспекты фрагментов без объединения.\n\n" + parts_block
+    )
+
+
 def _reduce_and_save(
     transcripts_order: list[Path],
     all_futures: list,
@@ -149,29 +299,37 @@ def _reduce_and_save(
 ) -> Path:
     if progress:
         progress({"log": "Фрагменты готовы, собираю финальный отчёт…"})
+    parts = []
+    failed_parts = 0
+    for i, fut in enumerate(all_futures, 1):
+        try:
+            parts.append(fut.result())
+        except Exception as exc:  # noqa: BLE001 — сбой одного фрагмента не убирает отчёт
+            failed_parts += 1
+            logger.error(f"Фрагмент {i}/{len(all_futures)} недоступен при сборке: {type(exc).__name__}: {exc}")
+            parts.append(_failed_fragment_note(i, "фрагмент", f"{type(exc).__name__}: {exc}"[:200]))
+    total_fragments = len(parts)
+
+    group_size = max(0, settings.nim_reduce_group_size)
+    if group_size and total_fragments > group_size:
+        # Промежуточные сводки сами эмитят прогресс REDUCE_FRACTION..0.95
+        parts = _intermediate_group_summaries(parts, group_size, progress)
+    if progress:
         progress({"p": "analysis", "phase_progress": 0.95})
-    parts = [fut.result() for fut in all_futures]
+
     parts_block = "\n\n".join(f"### Фрагмент {i}\n{p}" for i, p in enumerate(parts, 1))
-    final = plain_text(
-        nim_client.send_prompt(
-            build_reduce_prompt(len(transcripts_order), len(all_futures), parts_block),
-            deepthink=settings.nim_workers > 1,
-            expert=settings.nim_workers > 1,
-            stable_rounds=6,
-            model=settings.nim_reduce_model,
-        )
-    )
+    final = _final_reduce_with_fallback(parts_block, len(transcripts_order), total_fragments)
     target_dir = out_dir or settings.output_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     out_path = target_dir / f"report_{time.strftime('%Y%m%d_%H%M%S')}.txt"
-    header = _header_block(
-        "ЕДИНЫЙ ОТЧЁТ",
-        [
-            ("Транскриптов", len(transcripts_order)),
-            ("Фрагментов", len(all_futures)),
-            ("Дата", time.strftime("%d.%m.%Y %H:%M")),
-        ],
-    )
+    header_rows = [
+        ("Транскриптов", len(transcripts_order)),
+        ("Фрагментов", len(all_futures)),
+        ("Дата", time.strftime("%d.%m.%Y %H:%M")),
+    ]
+    if failed_parts:
+        header_rows.append(("Не обработано", failed_parts))
+    header = _header_block("ЕДИНЫЙ ОТЧЁТ", header_rows)
     out_path.write_text(header + final.strip() + "\n\n" + _footer_block("отчёта"), encoding="utf-8")
     if progress:
         progress({"p": "analysis", "phase_progress": 1.0})

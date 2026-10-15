@@ -10,6 +10,46 @@
 import threading
 
 
+# ---------------------------------------------------------------------------
+# Разграничение фаз — общие метки для веб-панели и CLI
+# ---------------------------------------------------------------------------
+
+# Человекочитаемые названия фаз. Фазы идут параллельно и раньше перебивали
+# друг друга в едином поле «current»; теперь у каждой фазы своя надпись.
+PHASE_LABELS = {
+    "transcribe": "Транскрибация",
+    "pdf": "PDF",
+    "ppt": "Презентации",
+    "spreadsheets": "Таблицы",
+    "images": "Картинки",
+    "documents": "Документы",
+    "analysis": "Анализ",
+}
+
+# Порядок отображения надписей: основная фаза, анализ, затем параллельные вложения
+PHASE_ORDER = ["transcribe", "analysis", "pdf", "ppt", "spreadsheets", "images", "documents"]
+
+
+def phase_label(phase: str) -> str:
+    return PHASE_LABELS.get(phase, phase or "")
+
+
+def format_file_event(event: dict) -> str | None:
+    """Строка прогресса для CLI из события пайплайна (None, если это не файл).
+
+    Формат: «Транскрибация: [36/4000] имя.mp3» — метка фазы разграничивает
+    параллельные процессы друг от друга.
+    """
+    if "file" not in event:
+        return None
+    label = phase_label(event.get("phase", ""))
+    prefix = f"{label}: " if label else ""
+    idx = event.get("file_index")
+    total = event.get("file_total")
+    counter = f"[{idx}/{total}] " if idx and total else ""
+    return f"{prefix}{counter}{event['file']}".strip()
+
+
 class PhaseProgress:
     """Проценты по всем фазам сразу; поддерживает параллельные фазы.
 

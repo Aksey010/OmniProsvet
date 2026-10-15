@@ -99,5 +99,85 @@ class TestPipelineIntegration:
         assert result["report"] is None
 
 
+class TestPresentationRouting:
+    @patch("src.pipeline.run_presentations")
+    @patch("src.pipeline.run_attachments")
+    @patch("src.pipeline.run_pdfs")
+    def test_pptx_and_ppt_routed_to_presentations(
+        self, mock_run_pdfs, mock_run_att, mock_run_pres, tmp_path, monkeypatch
+    ):
+        """ppt/pptx идут в run_presentations (как pdf -> run_pdfs); docx — в documents."""
+        import src.collect as collect_mod
+        from src.pipeline import run_pipeline
+
+        pptx = tmp_path / "deck.pptx"
+        ppt = tmp_path / "legacy.ppt"
+        docx = tmp_path / "doc.docx"
+        for f in (pptx, ppt, docx):
+            f.write_text("x")
+
+        monkeypatch.setattr(
+            collect_mod, "collect_media", lambda p, notify=None: ([], [], [], [pptx, ppt, docx])
+        )
+        mock_run_pres.return_value = [tmp_path / "deck.ppt.txt"]
+        mock_run_att.return_value = []
+        mock_run_pdfs.return_value = []
+
+        result = run_pipeline(
+            [str(tmp_path)], extract=False, process=False, images=False, progress=lambda e: None
+        )
+
+        assert mock_run_pres.called, "презентации должны обрабатываться run_presentations"
+        pres_files = mock_run_pres.call_args[0][0]
+        assert set(pres_files) == {pptx, ppt}
+        assert mock_run_att.called
+        assert mock_run_att.call_args[0][0] == [docx]
+        assert mock_run_att.call_args[0][1] == "documents"
+        assert not mock_run_pdfs.called
+        assert result["image_reports"] == [tmp_path / "deck.ppt.txt"]
+
+
+class TestSpreadsheetRouting:
+    @patch("src.pipeline.run_spreadsheets")
+    @patch("src.pipeline.run_attachments")
+    @patch("src.pipeline.run_presentations")
+    @patch("src.pipeline.run_pdfs")
+    def test_xlsx_xls_xlsm_routed_to_spreadsheets(
+        self, mock_run_pdfs, mock_run_pres, mock_run_att, mock_run_sheets, tmp_path, monkeypatch
+    ):
+        """xlsx/xlsm/xls идут в run_spreadsheets; docx остаётся в documents."""
+        import src.collect as collect_mod
+        from src.pipeline import run_pipeline
+
+        xlsx = tmp_path / "price.xlsx"
+        xlsm = tmp_path / "book.xlsm"
+        xls = tmp_path / "legacy.xls"
+        docx = tmp_path / "doc.docx"
+        for f in (xlsx, xlsm, xls, docx):
+            f.write_text("x")
+
+        monkeypatch.setattr(
+            collect_mod, "collect_media", lambda p, notify=None: ([], [], [], [xlsx, xlsm, xls, docx])
+        )
+        mock_run_sheets.return_value = [tmp_path / "price_abc.xlsx.txt"]
+        mock_run_att.return_value = []
+        mock_run_pres.return_value = []
+        mock_run_pdfs.return_value = []
+
+        result = run_pipeline(
+            [str(tmp_path)], extract=False, process=False, images=False, progress=lambda e: None
+        )
+
+        assert mock_run_sheets.called, "таблицы должны обрабатываться run_spreadsheets"
+        sheet_files = mock_run_sheets.call_args[0][0]
+        assert set(sheet_files) == {xlsx, xlsm, xls}
+        assert mock_run_att.called
+        assert mock_run_att.call_args[0][0] == [docx]
+        assert mock_run_att.call_args[0][1] == "documents"
+        assert not mock_run_pres.called
+        assert not mock_run_pdfs.called
+        assert result["image_reports"] == [tmp_path / "price_abc.xlsx.txt"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

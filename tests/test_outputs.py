@@ -72,13 +72,16 @@ class TestBuildZip:
     def test_scan_fallback_classifications(self, tmp_path):
         doc = _make(tmp_path / "doc_123.documents.txt", "д")
         scan = _make(tmp_path / "book_scan_abc.txt", "с")
+        deck = _make(tmp_path / "deck_abc.ppt.txt", "п")
         data = build_zip_bytes([
             {"name": doc.name, "path": str(doc)},
             {"name": scan.name, "path": str(scan)},
+            {"name": deck.name, "path": str(deck)},
         ])
         zf = zipfile.ZipFile(io.BytesIO(data))
         assert sorted(zf.namelist()) == [
             "summaries/book_scan_abc.txt",
+            "summaries/deck_abc.ppt.txt",
             "summaries/doc_123.documents.txt",
         ]
 
@@ -144,6 +147,79 @@ class TestPlainText:
 
     def test_no_changes_for_clean_text(self):
         s = "О ЧЁМ МАТЕРИАЛЫ\n\nОбычный абзац текста.\n\n- пункт списка"
+        assert plain_text(s) == s
+
+
+class TestPlainTextTables:
+    def test_markdown_table_flattened(self):
+        md = (
+            "Подробные данные\n"
+            "| Код | Наименование | Цена |\n"
+            "|-----|---------------|------|\n"
+            "| 47252 | ПОМАДА | 549 |\n"
+            "Конец."
+        )
+        out = plain_text(md)
+        assert "|" not in out, out
+        assert "-----" not in out
+        # разделитель удалён, данные сохранены и читаемы
+        assert "Код — Наименование — Цена" in out
+        assert "47252 — ПОМАДА — 549" in out
+
+    def test_table_without_edge_spaces(self):
+        out = plain_text("|47252|ПОМАДА|549|45,10|")
+        assert "|" not in out
+        assert "47252 — ПОМАДА — 549 — 45,10" in out
+
+    def test_table_separator_row_dropped(self):
+        out = plain_text("a | b\n| :---: | --- |\nпроект")
+        assert "|" not in out
+        assert "---" not in out
+        assert "a — b" in out
+        assert "проект" in out
+
+    def test_plain_pipe_free_text_untouched(self):
+        s = "обычный текст без труб"
+        assert plain_text(s) == s
+
+
+class TestPlainTextEmoji:
+    def test_keycap_digit_kept(self):
+        assert plain_text("1️⃣ Новинки каталога") == "1 Новинки каталога"
+
+    def test_emoji_removed(self):
+        out = plain_text("Прайс ✅ готов ⭐➿")
+        assert "✅" not in out and "⭐" not in out and "➿" not in out
+        assert "Прайс" in out and "готов" in out
+
+    def test_flag_removed(self):
+        out = plain_text("страна 🇷🇺 производитель")
+        assert "🇷🇺" not in out
+        assert "страна" in out and "производитель" in out
+
+    def test_legit_symbols_kept(self):
+        s = "Цена 549 ₽, № 12, ≈45%, диапазон 100—200, «кавычки»"
+        out = plain_text(s)
+        for sym in ("₽", "№", "≈", "—", "«"):
+            assert sym in out
+
+
+class TestPlainTextBullets:
+    def test_bullet_replaced_with_dash(self):
+        assert plain_text("• пункт первый") == "- пункт первый"
+
+    def test_bullet_variants(self):
+        for ch in ("•", "‣", "●", "▪", "○", "◦", "·"):
+            out = plain_text(f"{ch} пункт")
+            assert out == "- пункт", f"буллет {ch!r} не заменён: {out}"
+
+    def test_indented_bullet(self):
+        # отступ не первой строки сохраняется (общий .strip() трогает только края)
+        assert plain_text("Заголовок\n  • вложенный пункт") == "Заголовок\n  - вложенный пункт"
+
+    def test_mid_line_bullet_char_kept(self):
+        # «·» внутри строки (десятичный разделитель) не трогается
+        s = "скидка ≈ 0·34"
         assert plain_text(s) == s
 
 

@@ -28,6 +28,11 @@ class Settings:
     language: str = os.getenv("LANGUAGE", "auto")
     whisper_fast: bool = _as_bool("WHISPER_FAST", "1")
     whisper_batch_size: int = _as_int("WHISPER_BATCH_SIZE", 8)
+    whisper_compute_type: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+    # Устройство Whisper: auto (cuda при наличии GPU, иначе cpu) | cuda | cpu
+    whisper_device: str = os.getenv("WHISPER_DEVICE", "auto").strip().lower()
+    # Воркеры транскрибации (CPU-bound; > числа физических ядер смысла нет)
+    whisper_workers: int = _as_int("WHISPER_WORKERS", 4)
 
     # Диаризация (polyvoice)
     diarization: bool = _as_bool("DIARIZATION", "1")
@@ -37,6 +42,12 @@ class Settings:
     chunk_char_budget: int = _as_int("CHUNK_CHAR_BUDGET", 65000)
     chunk_max_lines: int = _as_int("CHUNK_MAX_LINES", 300)
     images_per_batch: int = _as_int("IMAGES_PER_BATCH", 25)
+    # Пропуск файлов по подстрокам имени (через запятую, регистр не важен).
+    # Стикеры Telegram (123_sticker.webm/.webp, 123_animation.gif.mp4) не несут
+    # речи и смыслового контента: транскрибация ломалась на них (388 ошибок
+    # «tuple index out of range» в сессии 13.10), а .webp-стикеры зря гонялись
+    # через дорогую vision-модель. Документы (pdf/docx/…) фильтром не трогаются.
+    skip_file_patterns: str = os.getenv("SKIP_FILE_PATTERNS", "sticker,animation.gif")
 
     # NVIDIA NIM API (бесплатный ключ с build.nvidia.com)
     nim_api_key: str = os.getenv("NIM_API_KEY", "")
@@ -51,6 +62,26 @@ class Settings:
     nim_workers: int = _as_int("NIM_WORKERS", 16)  # Увеличено для параллелизма
     nim_images_per_batch: int = _as_int("NIM_IMAGES_PER_BATCH", 3)  # Меньше батч = больше параллелизма
     nim_chunk_char_budget: int = _as_int("NIM_CHUNK_CHAR_BUDGET", 8000)  # Меньшие чанки = больше параллелизма
+    # Автопродолжение ответа при обрыве по max_tokens (0 = off)
+    nim_max_continuations: int = _as_int("NIM_MAX_CONTINUATIONS", 3)
+    # Фрагментов на промежуточную сводку в иерархическом reduce (0 = off)
+    nim_reduce_group_size: int = _as_int("NIM_REDUCE_GROUP_SIZE", 24)
+    # Максимум символов извлечённого текста документов НА ОДИН запрос.
+    # Прежние 400 000 симв. ≈ 100к+ токенов гарантированно превышали контекст
+    # моделей NIM (32k токенов) — запросы падали с HTTP 400.
+    nim_doc_text_chars: int = _as_int("NIM_DOC_TEXT_CHARS", 60_000)
+    # Read-таймаут HTTP-запроса к NIM (секунды). На урезанных картинках
+    # (даунскейл до 2048px) и компактных промптах ответы приходят за секунды;
+    # зависший запрос дешевле перезапустить (5 ретраев), чем ждать минуты.
+    nim_read_timeout: int = _as_int("NIM_READ_TIMEOUT", 180)
+    # Размер пула соединений httpx. Должен вмещать ОДНОВРЕМЕННЫЕ запросы всех
+    # параллельных фаз (PDF/таблицы/презентации/картинки), иначе потоки ждут
+    # свободный слот и падают с PoolTimeout (сессия 15.10: 62 PoolTimeout,
+    # потерянные фото при живом сервере).
+    nim_max_connections: int = _as_int("NIM_MAX_CONNECTIONS", 64)
+    # Картинки тяжелее этого (байт) ужимаются перед отправкой (2048px, JPEG
+    # q85): большие фото приводили к ReadTimeout на vision-модели.
+    nim_image_max_bytes: int = _as_int("NIM_IMAGE_MAX_BYTES", 3_000_000)
 
     # Пути
     base_dir: Path = Path(__file__).resolve().parent.parent

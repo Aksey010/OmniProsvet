@@ -134,5 +134,217 @@ class TestRunAnalysisIntegration:
         assert {"phase_done": "analysis"} in events
 
 
+class TestHierarchicalReduce:
+    def _prepare(self, tmp_path, monkeypatch, group_size: int):
+        import src.analysis as analysis
+        from src.configuration import Settings
+
+        fake = Settings(
+            chunk_char_budget=200,
+            chunk_max_lines=10,
+            nim_chunk_char_budget=200,
+            nim_reduce_group_size=group_size,
+        )
+        monkeypatch.setattr(src.analysis, "settings", fake)
+        monkeypatch.setattr(src.utils, "settings", fake)
+
+        class FakeNim:
+            def __init__(self):
+                self.calls: list[str] = []
+
+            def send_prompt(self, prompt, **kwargs):
+                self.calls.append(prompt)
+                return "Сводка: факт 5 мая."
+
+        fake_nim = FakeNim()
+        monkeypatch.setattr(analysis, "nim_client", fake_nim)
+        monkeypatch.setattr(analysis, "get_cached_fragment", lambda h: None)
+        monkeypatch.setattr(analysis, "save_fragment_cache", lambda h, s, t: None)
+        return fake_nim
+
+    def _make_transcripts(self, tmp_path, chunks: int):
+        # каждый фрагмент — отдельный «файл» длиннее половины бюджета
+        lines = [f"[00:00] {'x' * 150}" for _ in range(chunks)]
+        return [_write(tmp_path / "big.transcript.txt", lines)]
+
+    def test_small_job_has_no_intermediates(self, tmp_path, monkeypatch):
+        """Фрагментов не больше group_size — прежний одиночный reduce (регресс)."""
+        fake_nim = self._prepare(tmp_path, monkeypatch, group_size=10)
+        transcripts = self._make_transcripts(tmp_path, chunks=5)
+
+        _, report = _run_analysis_on_transcripts(transcripts, tmp_path, {"analysis": 100}, lambda e: None)
+
+        assert report is not None
+        # 5 map + 1 reduce = 6 запросов, промежуточных сводок нет
+        assert len(fake_nim.calls) == 6
+
+    def test_large_job_uses_group_summaries(self, tmp_path, monkeypatch):
+        """Фрагментов больше group_size — групповые сводки + финальный reduce."""
+        fake_nim = self._prepare(tmp_path, monkeypatch, group_size=10)
+        transcripts = self._make_transcripts(tmp_path, chunks=25)
+
+        events: list[dict] = []
+        _, report = _run_analysis_on_transcripts(transcripts, tmp_path, {"analysis": 100}, events.append)
+
+        assert report is not None
+        # 25 map + 3 промежуточных (10+10+5) + 1 финальный = 29
+        assert len(fake_nim.calls) == 29
+        # промежуточные сводки содержат шапку с диапазоном фрагментов
+        intermediates = [c for c in fake_nim.calls if "промежуточный конспект" in c.lower()]
+        assert len(intermediates) == 3
+        assert "1-10" in intermediates[0] or "1-10" in intermediates[1] or "1-10" in intermediates[2]
+        # финальный reduce получил уже СВОДКИ, а не 25 сырых конспектов
+        final = fake_nim.calls[-1]
+        assert "Сводка: факт 5 мая." in final
+        # прогресс не откатывался
+        fracs = [e["phase_progress"] for e in events if e.get("p") == "analysis"]
+        assert fracs == sorted(fracs)
+
+    def test_group_size_zero_disables_hierarchy(self, tmp_path, monkeypatch):
+        fake_nim = self._prepare(tmp_path, monkeypatch, group_size=0)
+        transcripts = self._make_transcripts(tmp_path, chunks=25)
+        _, report = _run_analysis_on_transcripts(transcripts, tmp_path, {"analysis": 100}, lambda e: None)
+        assert report is not None
+        assert len(fake_nim.calls) == 26  # 25 map + 1 reduce
+
+
+class TestAnalysisResilience:
+    """Анализ обязан завершаться при неисправимых ошибках NIM.
+
+    В сессии 14.10 (01:27, задача e72938ef) один ReadTimeout в
+    промежуточной сводке убил весь многочасовой анализ — отчёт не был
+    создан вообще. Теперь сбой фрагмента/группы даёт placeholder, а
+    отказ финального reduce — частичный отчёт.
+    """
+
+    def _prepare(self, tmp_path, monkeypatch, group_size: int = 0,
+                 nim_model: str = "default-model", nim_reduce_model: str = "reduce-model"):
+        import src.analysis as analysis
+        from src.configuration import Settings
+
+        fake = Settings(
+            chunk_char_budget=200,
+            chunk_max_lines=10,
+            nim_chunk_char_budget=200,
+            nim_reduce_group_size=group_size,
+            nim_model=nim_model,
+            nim_reduce_model=nim_reduce_model,
+        )
+        monkeypatch.setattr(analysis, "settings", fake)
+        monkeypatch.setattr(src.utils, "settings", fake)
+
+        from src.nim_client import NimError
+
+        class FakeNim:
+            def __init__(self, fail_on=None):
+                self.calls: list[tuple[str, dict]] = []
+                self.fail_on = fail_on
+
+            def send_prompt(self, prompt, **kwargs):
+                self.calls.append((prompt, kwargs))
+                if self.fail_on and self.fail_on(prompt, kwargs):
+                    raise NimError("NIM: не удалось получить ответ после 5 попыток. Сеть: ReadTimeout")
+                return "Конспект: событие 5 мая."
+
+        return fake, FakeNim
+
+    def _install(self, monkeypatch, fake_nim):
+        monkeypatch.setattr(src.analysis, "nim_client", fake_nim)
+        monkeypatch.setattr(src.analysis, "get_cached_fragment", lambda h: None)
+        monkeypatch.setattr(src.analysis, "save_fragment_cache", lambda h, s, t: None)
+
+    def _transcripts(self, tmp_path, chunks: int) -> list[Path]:
+        lines = [f"[00:00] {'x' * 150}" for _ in range(chunks)]
+        return [_write(tmp_path / "big.transcript.txt", lines)]
+
+    def test_map_failure_does_not_kill_analysis(self, tmp_path, monkeypatch):
+        """Сбой одного MAP-фрагмента: отчёт всё равно собирается, пропуск
+        виден в тексте, остальные фрагменты обработаны."""
+        _, FakeNim = self._prepare(tmp_path, monkeypatch)
+        state = {"n": 0}
+
+        def fail_first(prompt, kwargs):
+            state["n"] += 1
+            return state["n"] == 1
+
+        fake_nim = FakeNim(fail_on=fail_first)
+        self._install(monkeypatch, fake_nim)
+        transcripts = self._transcripts(tmp_path, chunks=5)
+
+        events: list[dict] = []
+        _, report = _run_analysis_on_transcripts(transcripts, tmp_path, {"analysis": 100}, events.append)
+
+        assert report is not None and Path(report).exists()
+        # placeholder виден на входе финального reduce (отчёт — его выход)
+        final_input = fake_nim.calls[-1][0]
+        assert "не обработан" in final_input, "пропущенный фрагмент не помечен"
+        assert "Конспект: событие 5 мая." in Path(report).read_text(encoding="utf-8")
+        # 5 map + 1 reduce: сбой не породил лишних попыток
+        assert len(fake_nim.calls) == 6
+        assert {"phase_done": "analysis"} in events
+
+    def test_group_summary_failure_does_not_kill_analysis(self, tmp_path, monkeypatch):
+        """Точка падения задачи e72938ef: сбой промежуточной сводки больше
+        не убивает анализ — группа помечается, финальный reduce проходит."""
+        _, FakeNim = self._prepare(tmp_path, monkeypatch, group_size=2)
+
+        def fail_group_1_2(prompt, kwargs):
+            # «фрагментов 1-2 » с пробелом: иначе совпадёт с «21-22»
+            return "промежуточный конспект" in prompt and "фрагментов 1-2 " in prompt
+
+        fake_nim = FakeNim(fail_on=fail_group_1_2)
+        self._install(monkeypatch, fake_nim)
+        transcripts = self._transcripts(tmp_path, chunks=25)
+
+        events: list[dict] = []
+        _, report = _run_analysis_on_transcripts(transcripts, tmp_path, {"analysis": 100}, events.append)
+
+        assert report is not None and Path(report).exists()
+        # сбойная группа помечена на входе финального reduce
+        assert "группа фрагментов 1-2" in fake_nim.calls[-1][0], "сбойная группа не помечена"
+        assert {"phase_done": "analysis"} in events
+        # финальный reduce состоялся: последним вызовом был НЕ промежуточный
+        last_prompt = fake_nim.calls[-1][0]
+        assert "промежуточный конспект" not in last_prompt
+
+    def test_final_reduce_falls_back_to_default_model(self, tmp_path, monkeypatch):
+        """Основная reduce-модель недоступна → повтор дефолтной, отчёт есть."""
+        _, FakeNim = self._prepare(
+            tmp_path, monkeypatch, group_size=0,
+            nim_model="default-model", nim_reduce_model="reduce-model",
+        )
+        fake_nim = FakeNim(fail_on=lambda p, kw: kw.get("model") == "reduce-model")
+        self._install(monkeypatch, fake_nim)
+        transcripts = self._transcripts(tmp_path, chunks=5)
+
+        _, report = _run_analysis_on_transcripts(transcripts, tmp_path, {"analysis": 100}, lambda e: None)
+
+        assert report is not None and Path(report).exists()
+        models_used = [kw.get("model") for _, kw in fake_nim.calls if kw.get("model")]
+        assert models_used == ["reduce-model", "default-model"]
+        text = Path(report).read_text(encoding="utf-8")
+        assert "ФИНАЛЬНАЯ СВОДКА НЕ УДАЛАСЬ" not in text
+
+    def test_total_reduce_failure_writes_partial_report(self, tmp_path, monkeypatch):
+        """Обе reduce-модели мертвы: отчёт всё равно записан — из сырых
+        конспектов, с честной пометкой (анализ не теряется целиком)."""
+        _, FakeNim = self._prepare(
+            tmp_path, monkeypatch, group_size=0,
+            nim_model="reduce-model", nim_reduce_model="reduce-model",
+        )
+        fake_nim = FakeNim(fail_on=lambda p, kw: kw.get("model") is not None)
+        self._install(monkeypatch, fake_nim)
+        transcripts = self._transcripts(tmp_path, chunks=5)
+
+        events: list[dict] = []
+        _, report = _run_analysis_on_transcripts(transcripts, tmp_path, {"analysis": 100}, events.append)
+
+        assert report is not None and Path(report).exists()
+        text = Path(report).read_text(encoding="utf-8")
+        assert "ФИНАЛЬНАЯ СВОДКА НЕ УДАЛАСЬ" in text
+        assert "Конспект: событие 5 мая." in text, "конспекты фрагментов потеряны"
+        assert {"phase_done": "analysis"} in events
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

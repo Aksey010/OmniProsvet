@@ -8,7 +8,8 @@ from src.configuration import settings
 from src.database import init_db
 from src.transcription import run_extract, run_extract_and_process
 from src.analysis import run_process_only
-from src.attachments import run_attachments, run_pdfs
+from src.attachments import run_attachments, run_pdfs, run_presentations
+from src.spreadsheets import run_spreadsheets
 
 
 def _group_names(paths: list[Path]) -> dict[str, str]:
@@ -68,13 +69,24 @@ def _attachments_worker(att_plan: list, weights: dict, progress, reports: list) 
         for kind, _, _ in tasks:
             progress({"phase": kind, "weight": weights.get(kind, 0)})
 
+    # Счётчики неудач по видам вложений: в финальной сводке задачи честно
+    # показать, сколько файлов не обработано (раньше они терялись в логе).
+    kind_stats: dict[str, dict] = {kind: {"total": len(files)} for kind, files, _ in tasks}
+    labels = {"images": "Картинки", "documents": "Документы"}
+
     with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
         futures = {}
         for kind, files, gdir in tasks:
             if kind == "pdf":
                 fut = executor.submit(run_pdfs, files, weights, progress, gdir, True)
+            elif kind == "ppt":
+                fut = executor.submit(run_presentations, files, weights, progress, gdir, True)
+            elif kind == "spreadsheets":
+                fut = executor.submit(run_spreadsheets, files, weights, progress, gdir, True)
             else:
-                fut = executor.submit(run_attachments, files, kind, weights, gdir, progress, True)
+                fut = executor.submit(
+                    run_attachments, files, kind, weights, gdir, progress, True, kind_stats[kind]
+                )
             futures[fut] = kind
 
         for fut in as_completed(futures):
@@ -89,6 +101,14 @@ def _attachments_worker(att_plan: list, weights: dict, progress, reports: list) 
                 # Фаза закончилась (успехом или ошибкой) — засчитываем вес целиком
                 if progress:
                     progress({"phase_done": kind})
+                st = kind_stats.get(kind) or {}
+                failed, total = st.get("failed", 0), st.get("total", 0)
+                if failed:
+                    name = labels.get(kind, kind)
+                    msg = f"{name}: не обработано файлов: {failed} из {total} (ошибки NIM — см. лог)"
+                    logger.warning(msg)
+                    if progress:
+                        progress({"log": msg})
 
 
 def run_pipeline(
@@ -114,19 +134,35 @@ def run_pipeline(
     media_with_groups: list[tuple[Path, Path]] = []
     att_plan: list[tuple[str, list[Path], Path]] = []
     found_any = False
+
+    def _notify_skipped(skipped: list[Path]) -> None:
+        # collect_media пишет в omniprosvet.log; дублируем в лог задачи,
+        # чтобы число выброшенных стикеров было видно в веб-панели.
+        if progress:
+            progress({"log": f"Пропущено файлов-стикеров/анимаций: {len(skipped)} (по шаблонам имён)"})
+
     for p in clean_paths:
-        a, v, im, d = collect_media(str(p))
+        a, v, im, d = collect_media(str(p), notify=_notify_skipped)
         gdir = settings.output_dir / group_names[str(p.resolve())]
         gdir.mkdir(parents=True, exist_ok=True)
         found_any = found_any or bool(a or v or im or d)
         for m in a + v:
             media_with_groups.append((m, gdir))
         pdfs = [f for f in d if f.suffix.lower() == ".pdf"]
-        others = [f for f in d if f.suffix.lower() != ".pdf"]
+        ppts = [f for f in d if f.suffix.lower() in (".pptx", ".ppt")]
+        sheets = [f for f in d if f.suffix.lower() in (".xlsx", ".xlsm", ".xls")]
+        others = [
+            f for f in d
+            if f.suffix.lower() not in (".pdf", ".pptx", ".ppt", ".xlsx", ".xlsm", ".xls")
+        ]
         if im:
             att_plan.append(("images", im, gdir))
         if pdfs:
             att_plan.append(("pdf", pdfs, gdir))
+        if ppts:
+            att_plan.append(("ppt", ppts, gdir))
+        if sheets:
+            att_plan.append(("spreadsheets", sheets, gdir))
         if others:
             att_plan.append(("documents", others, gdir))
 
@@ -149,13 +185,17 @@ def run_pipeline(
         )
         att_thread.start()
         if progress:
-            progress({"log": "Картинки, PDF и документы обрабатываются параллельно"})
+            progress({"log": "Картинки, PDF, презентации, таблицы и документы обрабатываются параллельно"})
     elif kinds:
         # Process sequentially but each kind in parallel internally
         for kind, files, gdir in att_plan:
             try:
                 if kind == "pdf":
                     att_reports += run_pdfs(files, weights, progress, gdir)
+                elif kind == "ppt":
+                    att_reports += run_presentations(files, weights, progress, gdir)
+                elif kind == "spreadsheets":
+                    att_reports += run_spreadsheets(files, weights, progress, gdir)
                 else:
                     att_reports += run_attachments(files, kind, weights, gdir, progress)
             except Exception as exc:

@@ -55,6 +55,40 @@ NIM_WORKERS=8
 - `deepseek-ai/deepseek-v4-pro-0813` — сильная альтернатива
 - `openai/gpt-oss-20b` — открытая модель от OpenAI
 
+## Ускорение на GPU (другая машина)
+
+Транскрибация — единственная локально-CPU-тяжёлая фаза; NIM работает в облаке
+и от видеокарты не зависит. Проект определяет GPU автоматически.
+
+### Требования
+
+1. NVIDIA GPU с compute capability ≥ 5.0 (GTX 1050+; реальный эффект — от RTX 3060
+   с 8+ ГБ VRAM) и свежим драйвером (CUDA 12: драйвер ≥ 527.41).
+2. CUDA-стек для CTranslate2 (faster-whisper):
+   ```bash
+   pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+   ```
+3. Проверка: `python -c "import ctranslate2; print(ctranslate2.get_cuda_device_count())"`
+   — должно быть ≥ 1.
+
+### Настройки (.env)
+
+```env
+WHISPER_DEVICE=auto        # auto (по умолчанию: cuda если есть GPU, иначе cpu) | cuda | cpu
+WHISPER_COMPUTE_TYPE=int8  # на GPU int8 автоматически повышается до float16;
+                           # задайте int8_float16 явно для экономии VRAM
+WHISPER_WORKERS=1          # на одной карте оптимально 1..2 (не 4!)
+WHISPER_BATCH_SIZE=16      # на GPU можно 16..32
+WHISPER_MODEL=large-v3     # на GPU large-v3 быстрее, чем small на CPU, и точнее
+```
+
+При `WHISPER_DEVICE=cuda` без рабочего драйвера проект не падает: в логе
+появится предупреждение и транскрибация уйдёт на CPU с обычным int8.
+
+Ожидаемый эффект: транскрибация с ~3–5× realtime (CPU) до ~20–60× realtime
+(batched + float16). Диаризация polyvoice работает параллельно и от GPU
+не зависит.
+
 ## Использование
 
 ### Командная строка

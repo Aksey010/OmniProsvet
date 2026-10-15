@@ -33,6 +33,12 @@ ACCEPT = (
     ".pdf,.docx,.doc,.txt,.rtf,.csv,.xlsx,.xls,.pptx,.ppt,.odt"
 )
 
+# Сколько последних строк лога задачи хранить в job (и в SQLite).
+# Полный лог всё равно пишется в omniprosvet.log; хранить тысячи строк в
+# job-записи — значит сериализовать мегабайты JSON на каждый тик прогресса
+# (в сессии 13.10 job дошёл до 500+ КБ и 7700 строк).
+MAX_JOB_LINES = 500
+
 MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3"]
 LANGUAGES = {"auto", "zh", "ru", "en", "ja", "ko", "de", "fr", "es"}
 
@@ -50,30 +56,61 @@ def run_job(job_id: str, paths: list[str], mode: str, diarize: bool, model: str,
     if not job:
         return
     pp = PhaseProgress()
+    # Троттлинг записи состояния в SQLite: тики прогресса приходят чаще
+    # двух раз в секунду, и каждая запись — сериализация всего job в JSON.
+    last_save = {"t": 0.0}
 
     def progress(event: dict) -> None:
         if "log" in event:
             job["lines"].append(event["log"])
+            if len(job["lines"]) > MAX_JOB_LINES:
+                del job["lines"][:-MAX_JOB_LINES]
             socketio.emit("job_log", {"job_id": job_id, "log": event["log"]})
-            save_job(job_id, job)
+            # Лог-события приходят пачками (по строке на каждый фрагмент/файл):
+            # писать весь job в SQLite на каждый — квадратичная нагрузка.
+            now = time.monotonic()
+            if now - last_save["t"] >= 0.5:
+                last_save["t"] = now
+                save_job(job_id, job)
             return
         pp.feed(event)
         pct = pp.percent()
         if pct > job.get("progress", 0):
             job["progress"] = pct
-        if "file" in event:
-            job["current"] = event["file"]
-            if event.get("file_index"):
-                job["file_index"] = event["file_index"]
-            if event.get("file_total"):
-                job["file_total"] = event["file_total"]
-        socketio.emit("job_progress", {"job_id": job_id, **job})
-        save_job(job_id, job)
+
+        # Статус по фазам: у каждой параллельной задачи — своя надпись.
+        # Раньше единое поле current/file_index перезаписывалось всеми фазами
+        # по очереди (36/4000 → 5/50 → обратно), и фазы «перебивали» друг друга.
+        status = job.setdefault("phase_status", {})
+        if "file" in event and event.get("phase"):
+            entry = status.setdefault(event["phase"], {})
+            entry["current"] = event["file"]
+            if event.get("file_index") is not None:
+                entry["index"] = event["file_index"]
+            if event.get("file_total") is not None:
+                entry["total"] = event["file_total"]
+        if "phase_progress" in event and event.get("p"):
+            status.setdefault(event["p"], {})["percent"] = min(
+                100, round(float(event["phase_progress"]) * 100)
+            )
+        if "phase_done" in event:
+            # Фаза закрыта — её надпись убирается, чужие надписи не трогаются
+            status.pop(event["phase_done"], None)
+
+        # В сокет — только состояние без строк лога: браузер получает лог
+        # инкрементально через job_log, а не 0.5 МБ JSON на каждый тик.
+        snapshot = {k: v for k, v in job.items() if k != "lines"}
+        socketio.emit("job_progress", {"job_id": job_id, **snapshot})
+        now = time.monotonic()
+        if now - last_save["t"] >= 0.5:
+            last_save["t"] = now
+            save_job(job_id, job)
 
     try:
         init_db()
         job["state"] = "working"
         job["progress"] = 0
+        job["phase_status"] = {}
         save_job(job_id, job)
         socketio.emit("job_status", {"job_id": job_id, "state": "working"})
 
@@ -90,6 +127,7 @@ def run_job(job_id: str, paths: list[str], mode: str, diarize: bool, model: str,
         )
         job["state"] = "done"
         job["progress"] = 100
+        job["phase_status"] = {}  # фазы закрыты — надписи не висят на завершённой задаче
         job["files"] = collect_job_files(result)
         if result["report"]:
             job["report"] = str(result["report"])
@@ -97,11 +135,14 @@ def run_job(job_id: str, paths: list[str], mode: str, diarize: bool, model: str,
             f"Готово. Транскриптов: {len(result['transcripts'])}, "
             f"отчётов по картинкам: {len(result['image_reports'])}"
         )
+        if len(job["lines"]) > MAX_JOB_LINES:
+            del job["lines"][:-MAX_JOB_LINES]
         save_job(job_id, job)
         socketio.emit("job_done", {"job_id": job_id, **job})
     except Exception as e:
         job["state"] = "error"
         job["error"] = str(e)
+        job["phase_status"] = {}
         save_job(job_id, job)
         logger.exception(f"Задача {job_id} упала с ошибкой")
         socketio.emit("job_error", {"job_id": job_id, "error": str(e)})
@@ -142,9 +183,9 @@ def start():
 
     job_id = uuid.uuid4().hex
     job_data = {
-        "state": "queued", "progress": 0, "lines": [], "current": "",
-        "file_index": 0, "file_total": 0, "error": "", "report": None,
-        "mode": model, "language": language, "diarize": diarize,
+        "state": "queued", "progress": 0, "lines": [], "phase_status": {},
+        "error": "", "report": None,
+        "mode": mode, "model": model, "language": language, "diarize": diarize,
         "paths": paths,  # Save paths for rerun
     }
     save_job(job_id, job_data)
@@ -164,31 +205,39 @@ def rerun(job_id):
     
     # Extract parameters from old job
     paths = old_job.get("paths", [])
-    mode = old_job.get("mode", "full")
+    # До фикса поле "mode" хранило имя модели, а режим терялся —
+    # поддерживаем оба формата записи (старые и новые задачи).
+    stored_mode = old_job.get("mode", "full")
+    if stored_mode not in ("full", "extract"):
+        stored_mode = "full"
     language = old_job.get("language", settings.language)
     diarize = old_job.get("diarize", True)
-    model = old_job.get("mode", settings.whisper_model)  # model is stored in "mode" field
-    
+    model = old_job.get("model") or (
+        old_job.get("mode") if old_job.get("mode") in MODEL_SIZES else settings.whisper_model
+    )
+    if model not in MODEL_SIZES:
+        model = settings.whisper_model
+
     if not paths:
         return jsonify(error="В исходной задаче нет путей для повторного запуска"), 400
-    
+
     # Validate paths still exist
     existing_paths = [p for p in paths if Path(p).exists()]
     if not existing_paths:
         return jsonify(error="Файлы из исходной задачи не найдены на диске"), 400
-    
+
     # Create new job with same parameters
     new_job_id = uuid.uuid4().hex
     job_data = {
-        "state": "queued", "progress": 0, "lines": [], "current": "",
-        "file_index": 0, "file_total": 0, "error": "", "report": None,
-        "mode": model, "language": language, "diarize": diarize,
+        "state": "queued", "progress": 0, "lines": [], "phase_status": {},
+        "error": "", "report": None,
+        "mode": stored_mode, "model": model, "language": language, "diarize": diarize,
         "paths": existing_paths,
     }
     save_job(new_job_id, job_data)
-    
+
     threading.Thread(
-        target=run_job, args=(new_job_id, existing_paths, mode, diarize, model, language), daemon=True
+        target=run_job, args=(new_job_id, existing_paths, stored_mode, diarize, model, language), daemon=True
     ).start()
     return jsonify(job_id=new_job_id)
 
@@ -300,6 +349,10 @@ PAGE = """<!DOCTYPE html>
   #log { font-size: 13px; line-height: 1.7; background: #fafafa; border: 1px solid #eee;
           border-radius: 8px; padding: 12px; max-height: 340px; overflow-y: auto; white-space: pre-wrap; }
   #status { font-size: 14px; color: #555; }
+  /* Одна надпись на каждую параллельную фазу — фазы не перебивают друг друга */
+  #phases { margin: 6px 0 2px; }
+  .phase-line { font-size: 13px; color: #333; line-height: 1.65; padding: 1px 0; }
+  .phase-name { font-weight: 600; color: #c62828; }
   .srcbtn { background: #e5e7eb; color: #333; padding: 9px 16px; font-size: 14px; margin-top: 0; margin-right: 8px; }
   .srcbtn:hover { background: #d5d8dd; }
   .srcbtn.active { background: #c62828; color: #fff; }
@@ -370,6 +423,7 @@ PAGE = """<!DOCTYPE html>
 
   <div class="card hidden" id="progress_card">
     <div id="status">Подготовка…</div>
+    <div id="phases"></div>
     <div id="bar"><div id="fill"></div></div>
     <div id="log"></div>
     <div id="downloads"></div>
@@ -380,6 +434,43 @@ PAGE = """<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let jobId = null, socket = null;
 let mode = "full";
+
+// Разграничение параллельных фаз: у каждой фазы (транскрибация, PDF,
+// презентации, картинки, документы, анализ) — СВОЯ надпись. Раньше единое
+// поле current/file_* перезаписывалось всеми фазами, и числа прыгали
+// (36 из 4000 → 5 из 50 → обратно).
+const PHASE_LABELS = { transcribe: "Транскрибация", pdf: "PDF", ppt: "Презентации",
+                       images: "Картинки", documents: "Документы", analysis: "Анализ" };
+const PHASE_ORDER = ["transcribe", "analysis", "pdf", "ppt", "images", "documents"];
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function phaseLine(phase, st) {
+  const parts = [];
+  if (st.percent != null) parts.push(st.percent + "%");
+  if (st.current) {
+    const counter = (st.total > 1 && st.index > 0)
+      ? "файл " + st.index + " из " + st.total + " — " : "";
+    parts.push(counter + st.current);
+  }
+  if (!parts.length) return "";
+  const label = PHASE_LABELS[phase] || phase;
+  return '<div class="phase-line"><span class="phase-name">' + esc(label) + ':</span> '
+         + esc(parts.join(" · ")) + "</div>";
+}
+
+function renderPhases(job) {
+  const st = job.phase_status || {};
+  const keys = PHASE_ORDER.filter(p => st[p]);
+  Object.keys(st).forEach(p => { if (keys.indexOf(p) < 0) keys.push(p); });
+  $("phases").innerHTML = keys.map(p => phaseLine(p, st[p])).join("");
+}
+
+function overallStatus(job) {
+  if (job.state === "queued") return "В очереди…";
+  if (job.state === "working") return "Выполняется… (процессы ниже идут параллельно)";
+  if (job.state === "done") return "Готово ✔";
+  return "";
+}
 
 const drop = $("drop"), fileInput = $("file");
 drop.onclick = () => fileInput.click();
@@ -430,10 +521,10 @@ function connectSocket() {
   socket.on("job_progress", (data) => {
     if (data.job_id !== jobId) return;
     $("fill").style.width = (data.progress || 0) + "%";
-    if (data.state === "queued") $("status").textContent = "В очереди…";
-    if (data.state === "working")
-      $("status").textContent = (data.file_total > 1 ? "Файл " + data.file_index + " из " + data.file_total + ": " : "") + (data.current || "работаю…");
-    if (data.error) $("status").innerHTML = '<span class="err">Ошибка: ' + data.error + "</span>";
+    const overall = overallStatus(data);
+    if (overall) $("status").textContent = overall;
+    if (data.error) $("status").innerHTML = '<span class="err">Ошибка: ' + esc(data.error) + "</span>";
+    renderPhases(data);
     if (data.lines && data.lines.length) { $("log").textContent = data.lines.join("\\n"); $("log").scrollTop = 1e9; }
   });
   socket.on("job_log", (data) => {
@@ -444,12 +535,14 @@ function connectSocket() {
     if (data.job_id !== jobId) return;
     $("go").disabled = false;
     $("status").textContent = "Готово ✔";
+    $("phases").innerHTML = "";
     loadFiles();
   });
   socket.on("job_error", (data) => {
     if (data.job_id !== jobId) return;
     $("go").disabled = false;
-    $("status").innerHTML = '<span class="err">Ошибка: ' + data.error + "</span>";
+    $("status").innerHTML = '<span class="err">Ошибка: ' + esc(data.error) + "</span>";
+    $("phases").innerHTML = "";
   });
   socket.on("disconnect", () => {
     console.log("WebSocket disconnected");
@@ -480,7 +573,7 @@ async function loadJobList() {
       <div onclick="showJob('${job.id}')" style="cursor:pointer">
         <strong>${job.id.slice(0,8)}</strong> <span class="job-status status-${job.state}">${job.state}</span>
       </div>
-      <div class="job-meta">${job.created_at} • ${job.mode || 'N/A'} • ${job.progress || 0}%</div>
+      <div class="job-meta">${job.created_at} • ${job.model || 'N/A'} • ${job.progress || 0}%</div>
       ${job.state === 'interrupted' ? `
         <button class="srcbtn" onclick="event.stopPropagation(); rerunJob('${job.id}', this, '▶ Продолжить')">▶ Продолжить</button>
       ` : (job.state === 'done' || job.state === 'error') ? `
@@ -511,14 +604,17 @@ function showJob(id) {
     if (job.state === "queued") {
       statusEl.textContent = "В очереди…";
     } else if (job.state === "working") {
-      statusEl.textContent = (job.file_total > 1 ? "Файл " + job.file_index + " из " + job.file_total + ": " : "") + (job.current || "работаю…");
+      statusEl.textContent = overallStatus(job);
     } else if (job.state === "done") {
       statusEl.textContent = "Готово ✔";
     } else if (job.state === "error") {
-      statusEl.innerHTML = '<span class="err">Ошибка: ' + (job.error || "неизвестная") + "</span>";
+      statusEl.innerHTML = '<span class="err">Ошибка: ' + esc(job.error || "неизвестная") + "</span>";
     } else if (job.state === "interrupted") {
       statusEl.innerHTML = '<span class="err">Прервана (сервер перезапускался) — нажмите «Продолжить»</span>';
     }
+
+    // Отдельные надписи по активным фазам (у завершённых задач их нет)
+    renderPhases(job);
     
     // Restore log
     if (job.lines && job.lines.length) { 

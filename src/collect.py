@@ -2,6 +2,10 @@ import hashlib
 import os
 from pathlib import Path
 
+from loguru import logger
+
+from src.configuration import settings
+
 AUDIO_EXT = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".wma", ".aac"}
 VIDEO_EXT = {
     ".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v",
@@ -46,17 +50,62 @@ def is_document(f: Path) -> bool:
         return False
     if name.startswith("report_") and name.endswith(".txt"):
         return False
-    if name.endswith(".images.txt") or name.endswith(".documents.txt"):
+    # Выходные конспекты (не входные документы): картинки/документы/PDF/презентации/таблицы
+    if name.endswith((".images.txt", ".documents.txt", ".pdf.txt", ".ppt.txt", ".xlsx.txt", ".xls.txt")):
         return False
     return f.suffix.lower() in DOCUMENT_EXT
 
 
-def collect_media(path_str: str) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
-    files = _iter_files(path_str)
+def _skip_patterns() -> tuple[str, ...]:
+    """Шаблоны пропуска (SKIP_FILE_PATTERNS): подстроки имени, регистр не важен."""
+    raw = (getattr(settings, "skip_file_patterns", "") or "").strip()
+    if not raw:
+        return ()
+    return tuple(p.strip().lower() for p in raw.split(",") if p.strip())
+
+
+def is_skipped(f: Path, patterns: tuple[str, ...] | None = None) -> bool:
+    """Файл-стикер/анимация: имя содержит один из шаблонов пропуска.
+
+    По умолчанию — 'sticker' и 'animation.gif' (стикеры Telegram). Такие файлы
+    не имеют ни речи, ни содержимого для отчёта: транскрибация на них падала
+    («tuple index out of range»), а .webp-стикеры занимали запросы vision-модели.
+    """
+    if patterns is None:
+        patterns = _skip_patterns()
+    if not patterns:
+        return False
+    name = f.name.lower()
+    return any(p in name for p in patterns)
+
+
+def collect_media(
+    path_str: str, notify=None
+) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
+    all_files = _iter_files(path_str)
+    # Документы — из ПОЛНОГО списка: фильтр стикеров не должен прятать
+    # содержательный файл вида sticker_pack_brief.pdf.
+    documents = [f for f in all_files if is_document(f)]
+
+    # Стикеры/анимации выбрасываются ДО классификации: не тратят время
+    # транскрибации и запросы vision-модели.
+    patterns = _skip_patterns()
+    files = all_files
+    if patterns:
+        skipped = [f for f in files if is_skipped(f, patterns)]
+        if skipped:
+            logger.info(
+                f"Пропущено файлов-стикеров/анимаций: {len(skipped)} "
+                f"(шаблоны имён: {', '.join(patterns)})"
+            )
+            if notify:
+                notify(skipped)
+        skip_set = set(skipped)
+        files = [f for f in files if f not in skip_set]
+
     audio = [f for f in files if f.suffix.lower() in AUDIO_EXT]
     video = [f for f in files if f.suffix.lower() in VIDEO_EXT]
     images = [f for f in files if f.suffix.lower() in IMAGE_EXT]
-    documents = [f for f in files if is_document(f)]
     return audio, video, images, documents
 
 

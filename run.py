@@ -33,6 +33,7 @@ def run_cli(args):
     from src.pipeline import run_pipeline
     from src.configuration import settings
     from src.database import init_db
+    from src.progress import format_file_event
     from loguru import logger
 
     logger.add("omniprosvet.log", rotation="1 week", encoding="utf-8")
@@ -47,14 +48,11 @@ def run_cli(args):
     def progress(event: dict) -> None:
         if "log" in event:
             logger.info(event["log"])
-        elif "file" in event:
-            pct = event.get("progress")
-            suffix = f" {pct}%" if pct else ""
-            print(
-                f"[{event.get('file_index', 0)}/{event.get('file_total', 0)}] "
-                f"{event['file']}{suffix}",
-                flush=True,
-            )
+        else:
+            # Метка фазы разграничивает параллельные процессы в потоке вывода
+            line = format_file_event(event)
+            if line:
+                print(line, flush=True)
 
     result = run_pipeline(
         [Path(p) for p in args.paths],

@@ -40,12 +40,16 @@ OmniProsvet — это пайплайн для извлечения информ
 ### `collect_media(path) -> (audio, video, images, documents)`
 1. Рекурсивно обходит путь (файл или директория)
 2. Пропускает служебные папки: `venv`, `.git`, `__pycache__`, `node_modules` и др.
-3. Классифицирует по расширениям:
+3. Выбрасывает стикеры/анимации по шаблонам имён `SKIP_FILE_PATTERNS`
+   (по умолчанию `sticker,animation.gif`): у стикеров Telegram нет ни речи,
+   ни содержания, а их обработка ломала транскрибацию и занимала vision-запросы.
+   Документы фильтр не трогает.
+4. Классифицирует по расширениям:
    - **Аудио**: wav, mp3, m4a, flac, ogg, opus, wma, aac
    - **Видео**: mp4, mkv, avi, mov, webm, m4v, wmv, flv, ts
    - **Изображения**: jpg, jpeg, png, webp, bmp, gif, tif, tiff
    - **Документы**: pdf, docx, doc, txt, rtf, csv, xlsx, xls, pptx, ppt, odt
-4. Исключает уже обработанные файлы: `*.transcript.txt`, `report_*.txt`, `*.images.txt`, `*.documents.txt`
+5. Исключает уже обработанные файлы: `*.transcript.txt`, `report_*.txt`, `*.images.txt`, `*.documents.txt`
 
 ### `transcript_path_for(media, base)`
 - Создаёт детерминированный путь для транскрипта на основе хеша абсолютного пути медиафайла
@@ -61,7 +65,7 @@ OmniProsvet — это пайплайн для извлечения информ
 ```
 media_files (N файлов)
     │
-    ├─► ThreadPoolExecutor(max_workers=min(4, N))
+    ├─► ThreadPoolExecutor(max_workers=min(WHISPER_WORKERS, N))
     │       ├─► Worker 1: _transcribe_single(file1)
     │       ├─► Worker 2: _transcribe_single(file2)
     │       ├─► Worker 3: _transcribe_single(file3)
@@ -149,15 +153,29 @@ def transcribe_file(media, model, language, diarize, on_progress, group_dir):
     │       ├─► plain_text() санитайзер
     │       └─► Сохранение в кэш
     │
-    ▼ REDUCE (один запрос)
+    ▼ REDUCE
     _reduce_and_save()
+    │   ├─► K ≤ NIM_REDUCE_GROUP_SIZE → один запрос (как раньше)
+    │   └─► K > NIM_REDUCE_GROUP_SIZE → иерархический reduce:
+    │         groups = chunks(parts, NIM_REDUCE_GROUP_SIZE)
+    │         промежуточные сводки групп — ПАРАЛЛЕЛЬНО (nim_workers)
+    │         финальный reduce по сводкам (компактный вход)
     │   ├─► parts_block = "### Фрагмент 1\n{конспект}..." (для промпта)
     │   ├─► NIM: build_reduce_prompt(files, chunks, parts)
     │   ├─► plain_text() санитайзер
     │   └─► Сохранение: output/report_{timestamp}.txt
 ```
 
+**Зачем иерархический reduce** (порог `NIM_REDUCE_GROUP_SIZE=24`):
+- вход финального запроса не растёт линейно с числом фрагментов (для 100 фрагментов
+  одиночный reduce получал бы ~150к символов ≈ 40к токенов);
+- выход каждого запроса ограничен (группа ≤24 конспектов) → реже упираемся в
+  `max_tokens`, меньше автопродолжений;
+- групповые сводки идут параллельно → reduce-фаза на больших задачах быстрее
+  последовательного одного гигантского запроса.
+
 - `_FragProgress` — тикает по завершении фрагмента; `frac = done/total × 0.9` (REDUCE_FRACTION).
+  Промежуточные сводки дают `0.9…0.95`, финальный reduce — `0.95…1.0` (монотонно).
 - Фаза `analysis` закрывается явным событием `{"phase_done": "analysis"}` — на всех путях выхода.
 
 ---
@@ -167,12 +185,14 @@ def transcribe_file(media, model, language, diarize, on_progress, group_dir):
 ### Параллельная обработка по типам (`src/pipeline.py::_attachments_worker`)
 
 ```
-att_plan = [("images", [...], gdir), ("pdf", [...], gdir), ("documents", [...], gdir)]
+att_plan = [("images", [...], gdir), ("pdf", [...], gdir),
+            ("ppt", [...], gdir), ("documents", [...], gdir)]
 
-ThreadPoolExecutor(max_workers=3):
-    ├─► run_attachments(images, ...)     # Vision NIM
-    ├─► run_pdfs(pdfs, ...)              # Текст + LLM / Vision fallback
-    └─► run_attachments(documents, ...)  # Текст + LLM
+ThreadPoolExecutor(max_workers=len(tasks)):
+    ├─► run_attachments(images, ...)      # Vision NIM
+    ├─► run_pdfs(pdfs, ...)               # Текст + LLM / Vision fallback
+    ├─► run_presentations(ppts, ...)      # PPTX-парсинг + LLM (новое)
+    └─► run_attachments(documents, ...)   # Текст + LLM
 ```
 
 Воркер анонсирует фазы с весами (`{"phase": kind, "weight": w}`) и закрывает их
@@ -202,30 +222,60 @@ ThreadPoolExecutor(max_workers=3):
 Склейка PDF (`_pdf_groups`/`_merge_pdf_group`) удалена из кода как мёртвая —
 обработка строго пер-файл.
 
+### `run_presentations` — пер-файл, параллельно (max_workers=min(4, NIM_WORKERS))
+Логика аналогична PDF: извлечение текста → чанкинг → MAP → кэш → конспект.
+```
+Для каждой презентации (.pptx/.ppt):
+    1. Извлечение текста (по слайдам):
+       - .pptx → python-pptx: надписи, таблицы, заметки; строка на текст-блок
+         до 500 символов (префикс «[Слайд N]»)
+       - .ppt (legacy) → конвертация в .pptx через PowerPoint COM (pywin32,
+         DispatchEx + коInit) с кэшем в tmp_pdfs/; без Office/pywin32 файл
+         пропускается с понятным сообщением
+    2. Есть текст → чанкинг (nim_chunk_char_budget=8000) → MAP (как этап 4)
+       → конспект → {stem}_{hash}.ppt.txt
+    3. Нет текста (слайды только из картинок) → пропуск с логом
+       (Vision-fallback не делается: рендер слайдов требует Office/LibreOffice)
+```
+Кэш — по `SHA256(name|size)`; MAP-фрагменты — в общем кэше `fragments`.
+
 ---
 
 ## Этап 6: NIM Client (`src/nim_client.py`)
 
-### Синхронный `send_prompt()`
-- Rate limiting: `_pace()` — min_interval = 60/RPM (единственный реальный лимит NIM)
-- Retry logic: до 5 попыток, экспоненциальная задержка
-- Обработка 429/5xx с `retry-after` заголовком
-- Любой запрос с `attachments` автоматически идёт Vision-моделью (`NIM_VISION_MODEL`)
-
-### Асинхронный `send_prompt_async()` + Connection Pooling
+### Один HTTP-клиент с keep-alive (было: `httpx.post()` на каждый запрос)
 ```python
-limits = httpx.Limits(
-    max_connections=NIM_WORKERS,      # 16
-    max_keepalive_connections=NIM_WORKERS,
-    keepalive_expiry=30.0,
+httpx.Client(
+    base_url=NIM_BASE_URL,
+    limits=httpx.Limits(max_connections=NIM_WORKERS, max_keepalive_connections=NIM_WORKERS),
+    timeout=300.0,
 )
 ```
-- **Keep-alive** соединения → нет overhead на TLS handshake
-- **Пул соединений** = NIM_WORKERS → полная утилизация rate limit
+- Соединения переиспользуются: нет TCP/TLS-рукопожатия на каждый запрос
+  (экономия ~0.2–0.4 с × число запросов; на задаче со 100+ запросами — десятки секунд).
+- Пул = NIM_WORKERS → полная утилизация RPM.
+- `send_prompt_async()` — тонкая обёртка (`asyncio.to_thread`) над синхронным
+  путём: логика (rate limit, ретраи, продолжение) не дублируется.
+
+### Rate limiting (`_pace`)
+- min_interval = 60/RPM — единственный реальный лимит NIM.
+- Если `x-ratelimit-remaining-requests ≤ 2`: ждём сброса окна по заголовку
+  `x-ratelimit-reset-requests` (≤5 с), а не фиксированные 5 с — прежний фикс
+  занижал темп до 12 RPM, хотя окно часто сбрасывалось через ~1 с.
+- Retry: до 5 попыток, экспоненциальная задержка, обработка 429/5xx с `retry-after`.
+
+### Автопродолжение при обрыве по `max_tokens`
+`finish_reason == "length"` больше не просто логируется: клиент досылает
+запрос-продолжение (assistant = накопленный текст + просьба продолжить),
+склеивает ответы, убирая повтор хвоста (`_strip_overlap`). Лимит —
+`NIM_MAX_CONTINUATIONS` (по умолчанию 3). Если и после него ответ обрезан —
+в текст добавляется честный маркер «[ОТВЕТ ОБРЕЗАН ПО ЛИМИТУ…]».
+Это позволяет не «упираться» в `NIM_MAX_TOKENS`: длинный ответ добирается
+дополнительными запросами, а не теряется.
 
 ### Подготовка вложений (`_build_messages`)
 - Изображения → base64 data URL → `image_url` в сообщении
-- Документы (PDF, DOCX, XLSX, TXT, CSV, RTF) → извлечение текста → вставка в промпт
+- Документы (PDF, DOCX, XLSX, PPTX, TXT, CSV, RTF) → извлечение текста → вставка в промпт
 - Макс. 400k символов из документов на запрос
 
 ---
@@ -250,6 +300,30 @@ percent() = Σ (вес завершённых фаз) + Σ (frac × вес) по
 
 ### `FilesProgress` — аккумулятор параллельных файлов
 Доля фазы = среднее процентов файлов; репортеры выдаются по индексу (`reporter(i, emit)`).
+
+### Отдельные надписи по фазам (вместо единого «Файл n из N»)
+Фазы идут параллельно и раньше перезаписывали единое поле `current/file_index/file_total`
+по очереди: транскрибация писала «36 из 4000», PDF — «5 из 50», и надпись «прыгала»
+между процессами. Теперь статус хранится **по фазам**: `job["phase_status"]` =
+`{phase: {"current", "index", "total", "percent"}}`.
+
+- `file`-событие обновляет запись **своей** фазы (по `event["phase"]`); соседние фазы
+  не затрагиваются;
+- `phase_progress`-событие пишет `percent` фазы;
+- `phase_done` удаляет **только** запись этой фазы;
+- при завершении задачи (`done`/`error`) `phase_status` очищается, чтобы надписи
+  не висели на законченной задаче.
+
+UI (`web_panel.PAGE`) рисует по строке на каждую активную фазу (транскрибация, анализ,
+PDF, презентации, картинки, документы) — с меткой фазы, процентом и, где применимо,
+счётчиком «файл n из N». Общий статус (`#status`) отделён и показывает состояние задачи
+(«Выполняется… / Готово ✔ / Ошибка…»). Метки фаз общие для веб-панели и CLI
+(`src/progress.py::PHASE_LABELS`/`phase_label`), CLI печатает строки вида
+`Транскрибация: [36/4000] имя.mp3` (`format_file_event`).
+
+Счётчик «файл n из N» внутри фазы по-прежнему считается по числу **завершённых**
+файлов (успех или ошибка) и потому монотонен; батчевые фазы вместо счётчика кладут
+прогресс в текст (`батч 2 из 7`).
 
 ### Веса фаз (`src/pipeline.py::_weights_for`)
 | Режим | Веса |
@@ -358,12 +432,16 @@ CREATE TABLE jobs (
 WHISPER_MODEL=small               # tiny/base/small/medium/large-v3
 WHISPER_FAST=1                    # BatchedInferencePipeline
 WHISPER_BATCH_SIZE=8              # Размер батча для fast mode
+WHISPER_COMPUTE_TYPE=int8         # int8 (CPU) / float16 (GPU — заметно быстрее)
+WHISPER_WORKERS=4                 # Параллельные файлы транскрибации
 DIARIZATION=1                     # Спикеры (polyvoice); 0 = отключить для ускорения
 
 # NIM — ограничение только RPM; стоимость запросов не учитывается
 NIM_RPM=120                       # Requests per minute (квота build.nvidia.com)
 NIM_WORKERS=16                    # Параллельные воркеры/соединения
 NIM_MAX_TOKENS=8192               # Меньше токенов = быстрее ответ
+NIM_MAX_CONTINUATIONS=3          # Автопродолжение при обрыве по max_tokens (0 = off)
+NIM_REDUCE_GROUP_SIZE=24          # Порог иерархического reduce (0 = off)
 NIM_CHUNK_CHAR_BUDGET=8000        # Меньшие чанки = больше параллелизма
 NIM_IMAGES_PER_BATCH=3            # Меньше картинок на запрос = быстрее
 
@@ -389,6 +467,7 @@ collect_media() → (audio[], video[], images[], documents[])
     │
     ├─► images[]  → run_attachments() → батчи по 3 → Vision NIM → *.images.txt
     ├─► pdfs[]    → run_pdfs() → пер-файл → pypdf → MAP NIM (или Vision fallback) → *.pdf.txt
+    ├─► ppts[]    → run_presentations() → пер-файл → python-pptx/COM → MAP NIM → *.ppt.txt
     └─► documents[] → run_attachments() → батчи → NIM → *.documents.txt
     │                (все типы — параллельными потоками, фазы анонсируются и закрываются)
     ▼
@@ -411,10 +490,11 @@ job["files"] = collect_job_files(result)   → UI: список файлов + �
 
 | Компонент | Текущий лимит | Как масштабировать |
 |-----------|---------------|-------------------|
-| Транскрибация | 4 воркера | Увеличить `max_workers` в `run_extract*` (CPU-bound) |
+| Транскрибация | WHISPER_WORKERS (4) | Увеличить `WHISPER_WORKERS` (CPU-bound) |
 | NIM MAP | NIM_WORKERS (16) | Увеличить квоту RPM, workers |
-| NIM REDUCE | 1 запрос | Не параллелится (сериализация) |
+| NIM REDUCE | группы параллельно, финал 1 запрос | Уменьшить `NIM_REDUCE_GROUP_SIZE` → больше параллельных сводок |
 | PDF | min(4, NIM_WORKERS) | Увеличить workers |
+| Презентации | min(4, NIM_WORKERS) | Увеличить workers |
 | Images/Docs | NIM_WORKERS | Увеличить квоту |
 
 ---
@@ -438,5 +518,10 @@ job["files"] = collect_job_files(result)   → UI: список файлов + �
 2. **Скан PDF без текста** → автоматически Vision-fallback; нужен установленный `pdf2image`
 3. **Медленная транскрибация** → `WHISPER_MODEL=small`/`base`, `WHISPER_FAST=1`
 4. **Нет спикеров** → `DIARIZATION=1` или проверить polyvoice загрузку
-5. **Старая задача без файлов** → список файлов стал записываться недавно; задачи старше
+5. **Legacy .ppt не читается** → нужен установленный Office (PowerPoint COM) + pywin32;
+   иначе конвертируйте файл в .pptx — он обрабатывается без Office
+6. **Ответ NIM обрывается по max_tokens** → автопродолжение уже включено
+   (`NIM_MAX_CONTINUATIONS`); можно также увеличить `NIM_MAX_TOKENS` или уменьшить
+   `NIM_CHUNK_CHAR_BUDGET`/`NIM_REDUCE_GROUP_SIZE`
+7. **Старая задача без файлов** → список файлов стал записываться недавно; задачи старше
    7 дней удаляются автоматически

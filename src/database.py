@@ -67,8 +67,14 @@ def save_job(job_id: str, data: dict) -> None:
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         now = int(time.time())
+        # UPSERT: created_at остаётся от ПЕРВОЙ вставки. INSERT OR REPLACE
+        # затирал его текущим временем при каждом сохранении — из-за этого
+        # в истории задач «создана» показывала последний тик прогресса,
+        # сортировка по created_at перемешивала список, а delete_old_jobs
+        # не мог удалить долгоживущую задачу (её «дата создания» обновлялась).
         conn.execute(
-            "INSERT OR REPLACE INTO jobs(id, data, created_at, updated_at) VALUES(?,?,?,?)",
+            "INSERT INTO jobs(id, data, created_at, updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
             (job_id, json.dumps(data, ensure_ascii=False), now, now),
         )
         conn.commit()

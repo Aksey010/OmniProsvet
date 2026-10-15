@@ -6,7 +6,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import pytest
 
-from src.progress import PhaseProgress, FilesProgress
+from src.progress import (
+    PHASE_LABELS,
+    PHASE_ORDER,
+    FilesProgress,
+    PhaseProgress,
+    format_file_event,
+    phase_label,
+)
 
 
 class TestPhaseProgressParallel:
@@ -145,6 +152,47 @@ class TestFilesProgress:
     def test_zero_total_safe(self):
         fp = FilesProgress(0)
         assert fp.reporter(1, None) is not None  # не падает
+
+
+class TestPhaseLabels:
+    """Разграничение фаз: у каждой параллельной задачи — своя метка."""
+
+    def test_known_phases_have_labels(self):
+        assert phase_label("transcribe") == "Транскрибация"
+        assert phase_label("pdf") == "PDF"
+        assert phase_label("ppt") == "Презентации"
+        assert phase_label("images") == "Картинки"
+        assert phase_label("documents") == "Документы"
+        assert phase_label("analysis") == "Анализ"
+
+    def test_unknown_phase_falls_back_to_name(self):
+        assert phase_label("ghost") == "ghost"
+        assert phase_label("") == ""
+
+    def test_order_covers_all_known_phases(self):
+        for name in PHASE_LABELS:
+            assert name in PHASE_ORDER
+
+
+class TestFormatFileEvent:
+    def test_file_with_counter_and_phase(self):
+        line = format_file_event(
+            {"file": "a.mp3", "file_index": 36, "file_total": 4000, "phase": "transcribe"}
+        )
+        assert line == "Транскрибация: [36/4000] a.mp3"
+
+    def test_batch_event_without_counter(self):
+        line = format_file_event({"file": "батч 2 из 7 (3 шт.)", "phase": "images"})
+        assert line == "Картинки: батч 2 из 7 (3 шт.)"
+
+    def test_non_file_events_return_none(self):
+        assert format_file_event({"log": "текст"}) is None
+        assert format_file_event({"phase_progress": 0.5, "p": "analysis"}) is None
+        assert format_file_event({"phase_done": "pdf"}) is None
+
+    def test_no_phase_no_label(self):
+        line = format_file_event({"file": "x.wav", "file_index": 1, "file_total": 2})
+        assert line == "[1/2] x.wav"
 
 
 if __name__ == "__main__":

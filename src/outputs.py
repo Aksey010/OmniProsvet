@@ -40,12 +40,13 @@ def _classify_arcname(name: str) -> str:
     """Относительный путь внутри ZIP по имени файла.
 
     - *.transcript.txt          → transcripts/<имя>
-    - *.pdf.txt / *.images.txt / *.documents.txt / *_scan_*.txt → summaries/<имя>
+    - *.pdf.txt / *.images.txt / *.documents.txt / *.ppt.txt / *.xlsx.txt / *.xls.txt
+      / *_scan_*.txt            → summaries/<имя>
     - прочее (report_*.txt)     → <имя> (корень архива)
     """
     if name.endswith(".transcript.txt"):
         return f"transcripts/{name}"
-    if name.endswith((".pdf.txt", ".images.txt", ".documents.txt")) or "_scan_" in name:
+    if name.endswith((".pdf.txt", ".images.txt", ".documents.txt", ".ppt.txt", ".xlsx.txt", ".xls.txt")) or "_scan_" in name:
         return f"summaries/{name}"
     return name
 
@@ -98,12 +99,27 @@ _BACKTICKS = re.compile(r"`+")
 _UNDER_EMPH = re.compile(r"(?<!\w)_([^_\n]+)_(?!\w)")
 _MULTI_BLANK = re.compile(r"\n{3,}")
 
+# Markdown-таблицы: строка-разделитель — только |, :, -, пробелы (и >=3 дефисов)
+_TABLE_SEP = re.compile(r"^[\s|:\-]*\-{3,}[\s|:\-]*$")
+# Крайние трубы строки данных: «| a | b |» -> «a | b»
+_TABLE_EDGE = re.compile(r"^\s*\|+|\|+\s*$")
+# Оставшиеся трубы -> тире (в выводе LLM труб быть не должно)
+_TABLE_PIPE = re.compile(r"\s*\|+\s*")
+_DASH_RUN = re.compile(r"(?:\s*—\s*){2,}")
+# Эмодзи (пиктограммы, dingbats, флаги, keycap-декорации «1️⃣», variation selector).
+# Буквы, цифры, ₽ (U+20BD), № (U+2116), ≈, тире и кавычки в диапазоны не входят.
+_EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u20E3]")
+# Буллеты в начале строки -> дефис (промпт требует перечисления через «- »)
+_BULLET = re.compile(r"^(\s*)[•‣●▪○◦·]\s*")
+
 
 def plain_text(text: str) -> str:
     """Привести LLM-ответ к читаемому plain text (выходной файл — .txt).
 
     Убирает markdown-разметку: звёздочки, обратные апострофы, решётки в
     заголовках, горизонтальные линии, html-теги, ссылки [текст](url) → «текст (url)».
+    Дополнительно: markdown-таблицы (| a | b |, |---|---|) → строки «a — b»,
+    эмодзи удаляются (keycap «1️⃣» → «1»), буллеты • в начале строки → «- ».
     Подчёркивания внутри слов (имена файлов, snake_case) сохраняются.
     """
     if not text:
@@ -114,12 +130,20 @@ def plain_text(text: str) -> str:
     out = _ASTERISKS.sub("", out)
     out = _BACKTICKS.sub("", out)
     out = _UNDER_EMPH.sub(r"\1", out)
+    out = _EMOJI.sub("", out)
 
     lines = []
     for raw in out.splitlines():
         line = raw.rstrip()
+        if _TABLE_SEP.match(line):
+            continue
         if _MD_HR.match(line):
             continue
+        if "|" in line:
+            line = _TABLE_EDGE.sub("", line)
+            line = _TABLE_PIPE.sub(" — ", line)
+            line = _DASH_RUN.sub(" — ", line)
+        line = _BULLET.sub(r"\1- ", line)
         line = _MD_HEADING.sub("", line)
         line = _MD_QUOTE.sub("", line)
         lines.append(line)
