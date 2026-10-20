@@ -99,6 +99,166 @@ class TestPipelineIntegration:
         assert result["report"] is None
 
 
+class TestRawPipeline:
+    @patch("src.raw_extract.run_raw_extract")
+    @patch("src.pipeline.run_attachments")
+    @patch("src.pipeline.run_pdfs")
+    @patch("src.pipeline.run_presentations")
+    @patch("src.pipeline.run_spreadsheets")
+    @patch("src.pipeline.run_extract")
+    @patch("src.collect.collect_media")  # run_pipeline импортирует его локально из src.collect
+    def test_raw_mode_routes_to_local_extraction(
+        self, mock_collect, mock_run_extract, mock_spreadsheets,
+        mock_presentations, mock_pdfs, mock_att, mock_raw, tmp_path,
+    ):
+        """raw-режим: все вложения идут в локальное извлечение; NIM-фазы и
+        анализ не вызываются вовсе."""
+        from src.pipeline import run_pipeline
+
+        doc = tmp_path / "doc.docx"
+        doc.write_text("x")
+        img = tmp_path / "p.jpg"
+        img.write_bytes(b"jpg")
+        mock_collect.return_value = ([], [], [img], [doc])
+        raw_out = tmp_path / "doc_abc.docx.raw.txt"
+        raw_out.write_text("извлечено", encoding="utf-8")
+        mock_raw.return_value = [raw_out]
+        mock_run_extract.return_value = []
+
+        events: list[dict] = []
+        result = run_pipeline(
+            [str(tmp_path)], extract=True, process=False, images=True, raw=True,
+            progress=events.append,
+        )
+
+        mock_raw.assert_called_once()
+        # все файлы (документы + картинки) ушли в raw-извлечение
+        raw_files_arg = mock_raw.call_args.args[0]
+        assert sorted(p.name for p in raw_files_arg) == ["doc.docx", "p.jpg"]
+        # NIM-фазы не вызывались
+        mock_att.assert_not_called()
+        mock_pdfs.assert_not_called()
+        mock_presentations.assert_not_called()
+        mock_spreadsheets.assert_not_called()
+        # транскрибация выполнена, анализ отсутствует
+        mock_run_extract.assert_called_once()
+        assert result["report"] is None
+        assert result["raw_files"] == [raw_out]
+        # фаза raw закрыта
+        assert {"phase_done": "raw"} in events
+
+    @patch("src.raw_extract.run_raw_extract")
+    @patch("src.pipeline.run_extract")
+    @patch("src.collect.collect_media")
+    def test_raw_respects_images_false(
+        self, mock_collect, mock_run_extract, mock_raw, tmp_path,
+    ):
+        """--no-images в raw-режиме: картинки исключены из извлечения."""
+        from src.pipeline import run_pipeline
+
+        doc = tmp_path / "doc.docx"
+        doc.write_text("x")
+        img = tmp_path / "p.jpg"
+        img.write_bytes(b"jpg")
+        mock_collect.return_value = ([], [], [img], [doc])
+        mock_raw.return_value = []
+        mock_run_extract.return_value = []
+
+        run_pipeline([str(tmp_path)], extract=True, process=False, images=False, raw=True)
+
+        raw_files_arg = mock_raw.call_args.args[0]
+        assert [p.name for p in raw_files_arg] == ["doc.docx"], "картинки должны быть исключены"
+
+
+class TestProgressCompleteness:
+    """Шкала обязана добирать до 100% в ЛЮБОМ режиме: фаза без данных
+    анонсирует вес и закрывается сразу (раньше extract без аудио полз
+    к 20% и скакал на 100 в конце)."""
+
+    @patch("src.collect.collect_media")
+    def test_raw_no_files_bar_reaches_100(self, mock_collect):
+        from src.pipeline import run_pipeline
+        from src.progress import PhaseProgress
+
+        mock_collect.return_value = ([], [], [], [])
+        events: list[dict] = []
+        pp = PhaseProgress()
+
+        def progress(e):
+            pp.feed(e)
+            events.append(e)
+
+        run_pipeline(["/fake"], extract=True, process=False, raw=True, progress=progress)
+
+        assert pp.percent() == 100, "шкала не добрала до 100%"
+        assert {"phase": "raw", "weight": 20} in events
+        assert {"phase_done": "raw"} in events
+        assert {"phase": "transcribe", "weight": 80} in events
+        assert {"phase_done": "transcribe"} in events
+
+    @patch("src.pipeline.run_pdfs")
+    @patch("src.pipeline.run_attachments")
+    @patch("src.collect.collect_media")
+    def test_extract_no_media_bar_reaches_100(self, mock_collect, mock_att, mock_pdfs, tmp_path):
+        """Extract-режим, папка только с вложениями (без аудио): раньше
+        transcribe (80%) терялся и шкала показывала максимум 20%."""
+        from src.pipeline import run_pipeline
+        from src.progress import PhaseProgress
+
+        img = tmp_path / "p.jpg"
+        img.write_bytes(b"jpg")
+        mock_collect.return_value = ([], [], [img], [])
+        mock_att.return_value = []
+        mock_pdfs.return_value = []
+        events: list[dict] = []
+        pp = PhaseProgress()
+
+        def progress(e):
+            pp.feed(e)
+            events.append(e)
+
+        run_pipeline([str(tmp_path)], extract=True, process=False, progress=progress)
+
+        assert pp.percent() == 100, "шкала не добрала до 100%"
+        assert {"phase": "transcribe", "weight": 80} in events
+        assert {"phase_done": "transcribe"} in events
+        # вложения (20%) анонсированы и закрыты воркером
+        assert any(e.get("phase") == "images" and "weight" in e for e in events)
+        assert {"phase_done": "images"} in events
+
+
+class TestEstimateWiring:
+    @patch("src.pipeline.emit_estimate")
+    @patch("src.pipeline.collect_media")
+    @patch("src.pipeline.run_extract_and_process")
+    def test_estimate_emitted_before_phases(
+        self, mock_run_extract, mock_collect, mock_emit, tmp_path
+    ):
+        """Оценка времени выводится ДО запуска фаз (после сбора плана)."""
+        from src.pipeline import run_pipeline
+
+        order: list[str] = []
+        mock_emit.side_effect = lambda *a, **k: order.append("estimate")
+        mock_collect.return_value = ([], [], [], [])
+        mock_run_extract.return_value = ([], None)
+
+        events: list[dict] = []
+
+        def progress(event: dict) -> None:
+            if "phase" in event and "estimate" not in order:
+                order.append("phase-first")
+            events.append(event)
+
+        run_pipeline([str(tmp_path)], extract=True, process=True, images=True, progress=progress)
+
+        assert order[0] == "estimate", "оценка должна идти до первой фазы"
+        mock_emit.assert_called_once()
+        # в emit переданы план вложений и флаги режима
+        kwargs = mock_emit.call_args.kwargs
+        assert kwargs["extract"] is True and kwargs["process"] is True
+        assert "att_plan" in kwargs and "media_files" in kwargs
+
+
 class TestPresentationRouting:
     @patch("src.pipeline.run_presentations")
     @patch("src.pipeline.run_attachments")

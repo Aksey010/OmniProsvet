@@ -1,11 +1,13 @@
 import threading
+import time
 from pathlib import Path
 
 from loguru import logger
 
 from src.collect import collect_media
 from src.configuration import settings
-from src.database import init_db
+from src.database import record_phase_timing
+from src.estimate import emit_estimate
 from src.transcription import run_extract, run_extract_and_process
 from src.analysis import run_process_only
 from src.attachments import run_attachments, run_pdfs, run_presentations
@@ -76,21 +78,26 @@ def _attachments_worker(att_plan: list, weights: dict, progress, reports: list) 
 
     with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
         futures = {}
+        started: dict[str, float] = {}
         for kind, files, gdir in tasks:
             if kind == "pdf":
-                fut = executor.submit(run_pdfs, files, weights, progress, gdir, True)
+                fn = run_pdfs
             elif kind == "ppt":
-                fut = executor.submit(run_presentations, files, weights, progress, gdir, True)
+                fn = run_presentations
             elif kind == "spreadsheets":
-                fut = executor.submit(run_spreadsheets, files, weights, progress, gdir, True)
+                fn = run_spreadsheets
             else:
-                fut = executor.submit(
-                    run_attachments, files, kind, weights, gdir, progress, True, kind_stats[kind]
-                )
-            futures[fut] = kind
+                fn = run_attachments
+            started[kind] = time.monotonic()
+            if fn is run_attachments:
+                futures[executor.submit(
+                    fn, files, kind, weights, gdir, progress, True, kind_stats[kind]
+                )] = (kind, len(files))
+            else:
+                futures[executor.submit(fn, files, weights, progress, gdir, True)] = (kind, len(files))
 
         for fut in as_completed(futures):
-            kind = futures[fut]
+            kind, n_files = futures[fut]
             try:
                 reports.extend(fut.result())
             except Exception as exc:
@@ -98,6 +105,8 @@ def _attachments_worker(att_plan: list, weights: dict, progress, reports: list) 
                 if progress:
                     progress({"log": f"Ошибка обработки {kind}: {exc}"})
             finally:
+                # Статистика скорости фазы для оценок времени будущих запусков
+                record_phase_timing(kind, n_files, time.monotonic() - started[kind])
                 # Фаза закончилась (успехом или ошибкой) — засчитываем вес целиком
                 if progress:
                     progress({"phase_done": kind})
@@ -119,6 +128,7 @@ def run_pipeline(
     extract: bool = True,
     process: bool = True,
     images: bool = True,
+    raw: bool = False,
     out_dir: Path | None = None,
     progress=None,
 ) -> dict:
@@ -172,12 +182,51 @@ def run_pipeline(
             progress({"log": "Поддерживаемых файлов (аудио/видео/картинки/документы) не найдено"})
 
     kinds = [k for k, files, _ in att_plan if files]
-    weights = _weights_for(extract, process, kinds)
+    if not images:
+        # Флаг «не обрабатывать картинки»: раньше был мёртвым (объявлен,
+        # передавался из UI/CLI — и игнорировался). Теперь честно исключает
+        # картинки из плана обработки во всех режимах.
+        att_plan = [(k, f, g) for k, f, g in att_plan if k != "images"]
+        kinds = [k for k in kinds if k != "images"]
+    if raw:
+        weights = _weights_for(extract, False, ["raw"])
+    else:
+        weights = _weights_for(extract, process, kinds)
     out_dir = settings.output_dir
 
+    # Предварительная оценка времени — ДО запуска фаз: пользователь видит
+    # ориентир (в логе задачи веб-панели и в консоли CLI).
+    emit_estimate(
+        media_files=[m for m, _ in media_with_groups],
+        att_plan=att_plan,
+        extract=extract,
+        process=process,
+        raw=raw,
+        progress=progress,
+    )
+
     att_reports: list[Path] = []
+    raw_files: list[Path] = []
     att_thread = None
-    if (extract or process) and kinds:
+    raw_thread = None
+    if raw:
+        # Режим «без умной обработки»: все вложения — локальное извлечение,
+        # NIM не вызывается; анализ/отчёт отсутствуют (process=False ниже).
+        # Фильтр images применён выше — картинки исключены, если запрещены.
+        raw_all = [f for _, files, _ in att_plan for f in files]
+        if raw_all:
+            raw_thread = threading.Thread(
+                target=_raw_worker,
+                args=(raw_all, weights, progress, raw_files, out_dir),
+                name="omni-raw",
+            )
+            raw_thread.start()
+        elif progress:
+            # Нечего извлекать — фаза закрывается сразу с анонсом веса:
+            # иначе 20% raw никогда не засчитываются, шкала не добирает до 100%
+            progress({"phase": "raw", "weight": weights.get("raw", 0)})
+            progress({"phase_done": "raw"})
+    elif (extract or process) and kinds:
         att_thread = threading.Thread(
             target=_attachments_worker,
             args=(att_plan, weights, progress, att_reports),
@@ -189,6 +238,7 @@ def run_pipeline(
     elif kinds:
         # Process sequentially but each kind in parallel internally
         for kind, files, gdir in att_plan:
+            started = time.monotonic()
             try:
                 if kind == "pdf":
                     att_reports += run_pdfs(files, weights, progress, gdir)
@@ -201,6 +251,7 @@ def run_pipeline(
             except Exception as exc:
                 logger.error(f"Обработка {kind} упала: {type(exc).__name__}: {exc}")
             finally:
+                record_phase_timing(kind, len(files), time.monotonic() - started)
                 if progress:
                     progress({"phase_done": kind})
 
@@ -217,5 +268,27 @@ def run_pipeline(
 
     if att_thread is not None:
         att_thread.join()
+    if raw_thread is not None:
+        raw_thread.join()
 
-    return {"transcripts": transcripts, "report": report, "image_reports": att_reports}
+    return {
+        "transcripts": transcripts,
+        "report": report,
+        "image_reports": att_reports,
+        "raw_files": raw_files,
+    }
+
+
+def _raw_worker(files: list[Path], weights: dict, progress, raw_files: list, out_dir: Path) -> None:
+    """Фоновый воркер raw-режима: локальное извлечение всех файлов в текст."""
+    from src.raw_extract import run_raw_extract
+
+    try:
+        raw_files.extend(run_raw_extract(files, weights, progress, out_dir))
+    except Exception as exc:
+        logger.error(f"Raw-извлечение упало: {type(exc).__name__}: {exc}")
+        if progress:
+            progress({"log": f"Ошибка извлечения: {exc}"})
+    finally:
+        if progress:
+            progress({"phase_done": "raw"})

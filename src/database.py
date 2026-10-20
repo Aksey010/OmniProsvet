@@ -27,6 +27,13 @@ def init_db() -> None:
             "id TEXT PRIMARY KEY, data TEXT, created_at INTEGER, updated_at INTEGER)"
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at)")
+        # Статистика скорости фаз: (единиц обработано, суммарные секунды фазы).
+        # Используется для предварительной оценки времени следующих запусков.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS phase_timings ("
+            "kind TEXT PRIMARY KEY, units INTEGER NOT NULL, seconds REAL NOT NULL,"
+            " updated_at INTEGER)"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -204,3 +211,53 @@ def mark_interrupted_jobs() -> int:
     if marked:
         logger.info(f"Помечено как прерванные: {marked} задач(а)")
     return marked
+
+
+def record_phase_timing(kind: str, units: int, seconds: float) -> None:
+    """Накопить статистику фазы: units обработанных единиц за seconds секунд.
+
+    seconds — СТЕННОЕ время фазы (с учётом параллелизма и лимитов NIM):
+    среднее seconds/units затем служит прогнозом скорости для оценки времени.
+    """
+    if units <= 0 or seconds <= 0:
+        return
+    import sqlite3
+
+    conn = sqlite3.connect(str(get_conn()))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "INSERT INTO phase_timings(kind, units, seconds, updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(kind) DO UPDATE SET "
+            "units=units+excluded.units, seconds=seconds+excluded.seconds,"
+            " updated_at=excluded.updated_at",
+            (kind, units, seconds, int(time.time())),
+        )
+        conn.commit()
+    except Exception as exc:
+        logger.warning(f"Не удалось сохранить статистику фазы {kind}: {exc}")
+    finally:
+        conn.close()
+
+
+def get_phase_timings() -> dict[str, tuple[int, float]]:
+    """Накопленная статистика: kind -> (units, seconds). Пустая таблица не ошибка."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(get_conn()))
+    result: dict[str, tuple[int, float]] = {}
+    try:
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='phase_timings'"
+        )
+        if not cursor.fetchone():
+            return result
+        for kind, units, seconds in conn.execute(
+            "SELECT kind, units, seconds FROM phase_timings WHERE units > 0"
+        ):
+            result[kind] = (units, seconds)
+    except Exception as exc:
+        logger.warning(f"Не удалось прочитать статистику фаз: {exc}")
+    finally:
+        conn.close()
+    return result

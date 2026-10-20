@@ -108,5 +108,39 @@ class TestFileCounters:
         assert {"phase": "analysis", "weight": 40} in events
 
 
+class TestEmptyPhasesCloseProgress:
+    """Фаза без данных обязана анонсировать вес и закрыться: иначе шкала
+    прогресса не добирает до 100% (ползёт к 20% и скачет в конце)."""
+
+    def test_run_extract_empty_closes_phase(self):
+        events: list[dict] = []
+        run_extract([], "small", "ru", False, {"transcribe": 80}, events.append)
+        assert {"phase": "transcribe", "weight": 80} in events
+        assert {"phase_done": "transcribe"} in events
+
+    def test_run_extract_and_process_empty_closes_both(self):
+        events: list[dict] = []
+        tr.run_extract_and_process(
+            [], "small", "ru", False, None, {"transcribe": 45, "analysis": 30}, events.append
+        )
+        assert {"phase": "transcribe", "weight": 45} in events
+        assert {"phase_done": "transcribe"} in events
+        assert {"phase": "analysis", "weight": 30} in events
+        assert {"phase_done": "analysis"} in events
+
+    def test_no_transcripts_closes_analysis(self, tmp_path, monkeypatch):
+        """Транскрибация прошла, но ни одного транскрипта — анализ закрывается."""
+        monkeypatch.setattr(tr, "transcribe_file", lambda f, *a, **k: None)
+        events: list[dict] = []
+        tr.run_extract_and_process(
+            [(tmp_path / "a.mp3", tmp_path)], "small", "ru", False, None,
+            {"transcribe": 45, "analysis": 30}, events.append,
+        )
+        assert {"phase": "transcribe", "weight": 45} in events
+        assert {"phase_done": "transcribe"} in events
+        assert {"phase": "analysis", "weight": 30} in events
+        assert {"phase_done": "analysis"} in events
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

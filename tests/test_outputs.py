@@ -1,4 +1,3 @@
-import io
 import sys
 import zipfile
 from pathlib import Path
@@ -8,13 +7,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import pytest
 
-from src.outputs import build_zip_bytes, collect_job_files, plain_text
+from src.outputs import build_zip_to_file, collect_job_files, plain_text
 
 
 def _make(p: Path, content: str = "x") -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return p
+
+
+def _zip(tmp_path, files) -> zipfile.ZipFile:
+    """ZIP в памяти для тестов: через файловый сборщик (единственный в проде)."""
+    dest = tmp_path / "test.zip"
+    build_zip_to_file(files, dest)
+    return zipfile.ZipFile(dest)
 
 
 class TestCollectJobFiles:
@@ -43,6 +49,14 @@ class TestCollectJobFiles:
         assert collect_job_files({}) == []
         assert collect_job_files({"report": None, "transcripts": [], "image_reports": []}) == []
 
+    def test_raw_files_collected(self, tmp_path):
+        """Raw-режим: извлечённые тексты попадают в список файлов задачи."""
+        t = _make(tmp_path / "a.transcript.txt")
+        raw = _make(tmp_path / "plan_abc.docx.raw.txt")
+        result = {"transcripts": [t], "raw_files": [raw], "image_reports": []}
+        names = [f["name"] for f in collect_job_files(result)]
+        assert names == ["a.transcript.txt", "plan_abc.docx.raw.txt"]
+
     def test_accepts_str_paths(self, tmp_path):
         t = _make(tmp_path / "a.transcript.txt")
         result = {"report": str(t), "transcripts": [], "image_reports": []}
@@ -51,57 +65,118 @@ class TestCollectJobFiles:
 
 
 class TestBuildZip:
-    def test_zip_contains_exactly_job_files(self, tmp_path):
+    def test_zip_categories_tree(self, tmp_path):
+        """Двухуровневое дерево: стадия обработки -> тип источника."""
         report = _make(tmp_path / "report_20260101.txt", "ОТЧЁТ")
         tr = _make(tmp_path / "h" / "video.transcript.txt", "[00:00] Спикер 1: привет")
-        sm = _make(tmp_path / "book_abc.pdf.txt", "конспект")
-        data = build_zip_bytes([
+        img = _make(tmp_path / "photo_abc.images.txt", "OCR текст")
+        pdf = _make(tmp_path / "book_abc.pdf.txt", "конспект")
+        zf = _zip(tmp_path, [
             {"name": report.name, "path": str(report)},
             {"name": tr.name, "path": str(tr)},
-            {"name": sm.name, "path": str(sm)},
+            {"name": img.name, "path": str(img)},
+            {"name": pdf.name, "path": str(pdf)},
             {"name": "ghost.txt", "path": str(tmp_path / "missing.txt")},  # не существует
         ])
-        zf = zipfile.ZipFile(io.BytesIO(data))
         assert sorted(zf.namelist()) == [
-            "report_20260101.txt",
-            "summaries/book_abc.pdf.txt",
-            "transcripts/video.transcript.txt",
+            "вторичная обработка/конспекты PDF/book_abc.pdf.txt",
+            "отчёты/report_20260101.txt",
+            "первичная обработка/картинки OCR/photo_abc.images.txt",
+            "первичная обработка/транскрипты/video.transcript.txt",
         ]
-        assert zf.read("report_20260101.txt").decode("utf-8") == "ОТЧЁТ"
+        assert zf.read("отчёты/report_20260101.txt").decode("utf-8") == "ОТЧЁТ"
 
     def test_scan_fallback_classifications(self, tmp_path):
         doc = _make(tmp_path / "doc_123.documents.txt", "д")
         scan = _make(tmp_path / "book_scan_abc.txt", "с")
         deck = _make(tmp_path / "deck_abc.ppt.txt", "п")
-        data = build_zip_bytes([
+        sheet = _make(tmp_path / "price_abc.xlsx.txt", "т")
+        raw = _make(tmp_path / "plan_abc.docx.raw.txt", "r")
+        raw_img = _make(tmp_path / "photo_abc.jpg.raw.txt", "ф")
+        zf = _zip(tmp_path, [
             {"name": doc.name, "path": str(doc)},
             {"name": scan.name, "path": str(scan)},
             {"name": deck.name, "path": str(deck)},
+            {"name": sheet.name, "path": str(sheet)},
+            {"name": raw.name, "path": str(raw)},
+            {"name": raw_img.name, "path": str(raw_img)},
         ])
-        zf = zipfile.ZipFile(io.BytesIO(data))
         assert sorted(zf.namelist()) == [
-            "summaries/book_scan_abc.txt",
-            "summaries/deck_abc.ppt.txt",
-            "summaries/doc_123.documents.txt",
+            "raw-извлечение/photo_abc.jpg.raw.txt",
+            "raw-извлечение/plan_abc.docx.raw.txt",
+            "вторичная обработка/конспекты презентаций/deck_abc.ppt.txt",
+            "вторичная обработка/конспекты таблиц/price_abc.xlsx.txt",
+            "вторичная обработка/распознанные документы/doc_123.documents.txt",
+            "первичная обработка/сканы PDF OCR/book_scan_abc.txt",
         ]
 
     def test_name_collision_gets_suffix(self, tmp_path):
         a = _make(tmp_path / "g1" / "x.transcript.txt", "A")
         b = _make(tmp_path / "g2" / "x.transcript.txt", "B")
-        data = build_zip_bytes([
+        zf = _zip(tmp_path, [
             {"name": a.name, "path": str(a)},
             {"name": b.name, "path": str(b)},
         ])
-        zf = zipfile.ZipFile(io.BytesIO(data))
         names = sorted(zf.namelist())
-        assert names == ["transcripts/x.transcript.txt", "transcripts/x.transcript_2.txt"]
+        assert names == [
+            "первичная обработка/транскрипты/x.transcript.txt",
+            "первичная обработка/транскрипты/x.transcript_2.txt",
+        ]
         contents = {zf.read(n).decode("utf-8") for n in names}
         assert contents == {"A", "B"}  # содержимое не перепуталось
 
-    def test_empty_files_list(self):
-        assert build_zip_bytes([]) != b""
-        zf = zipfile.ZipFile(io.BytesIO(build_zip_bytes([])))
+    def test_empty_files_list(self, tmp_path):
+        zf = _zip(tmp_path, [])
         assert zf.namelist() == []
+
+    def test_unknown_files_go_to_misc(self, tmp_path):
+        odd = _make(tmp_path / "что-то_непонятное.txt", "?")
+        zf = _zip(tmp_path, [{"name": odd.name, "path": str(odd)}])
+        assert zf.namelist() == [f"прочее/{odd.name}"]
+
+
+class TestZipToFileCache:
+    def test_build_writes_file_and_sidecar(self, tmp_path):
+        from src.outputs import build_zip_to_file
+
+        f = _make(tmp_path / "a.transcript.txt", "текст")
+        dest = tmp_path / "zips" / "job1.zip"
+        path, count = build_zip_to_file([{"name": f.name, "path": str(f)}], dest)
+        assert path == dest and dest.is_file()
+        assert count == 1
+        meta = (dest.with_suffix(".json")).read_text(encoding="utf-8")
+        assert '"files": 1' in meta
+        zf = zipfile.ZipFile(dest)
+        assert zf.namelist() == ["первичная обработка/транскрипты/a.transcript.txt"]
+
+    def test_get_or_build_cached_until_file_count_changes(self, tmp_path):
+        import time as _time
+
+        from src.outputs import get_or_build_zip
+
+        f = _make(tmp_path / "a.transcript.txt", "текст")
+        dest = tmp_path / "job1.zip"
+        files = [{"name": f.name, "path": str(f)}]
+
+        p1 = get_or_build_zip(files, dest)
+        mtime1 = dest.stat().st_mtime_ns
+        _time.sleep(0.01)
+        # тот же состав -> кэш, файл не пересобран
+        assert get_or_build_zip(files, dest) == dest
+        assert dest.stat().st_mtime_ns == mtime1
+
+        # добавился файл -> пересборка
+        f2 = _make(tmp_path / "b.transcript.txt", "текст 2")
+        files.append({"name": f2.name, "path": str(f2)})
+        assert get_or_build_zip(files, dest) == dest
+        assert dest.stat().st_mtime_ns != mtime1
+        zf = zipfile.ZipFile(dest)
+        assert len(zf.namelist()) == 2
+
+    def test_get_or_build_none_without_existing_files(self, tmp_path):
+        from src.outputs import get_or_build_zip
+
+        assert get_or_build_zip([{"name": "x", "path": str(tmp_path / "nope.txt")}], tmp_path / "j.zip") is None
 
 
 class TestPlainText:

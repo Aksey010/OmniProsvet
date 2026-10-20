@@ -346,5 +346,16 @@ class TestAnalysisResilience:
         assert {"phase_done": "analysis"} in events
 
 
+    def test_no_transcripts_closes_analysis_phase(self):
+        """Нет транскриптов — фаза анализа закрывается с весом (шкала полна)."""
+        from src.analysis import run_analysis_on_transcripts
+
+        events: list[dict] = []
+        _, report = run_analysis_on_transcripts([], None, {"analysis": 75}, events.append)
+        assert report is None
+        assert {"phase": "analysis", "weight": 75} in events
+        assert {"phase_done": "analysis"} in events
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

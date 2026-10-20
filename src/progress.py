@@ -18,6 +18,7 @@ import threading
 # друг друга в едином поле «current»; теперь у каждой фазы своя надпись.
 PHASE_LABELS = {
     "transcribe": "Транскрибация",
+    "raw": "Извлечение (без NIM)",
     "pdf": "PDF",
     "ppt": "Презентации",
     "spreadsheets": "Таблицы",
@@ -27,7 +28,7 @@ PHASE_LABELS = {
 }
 
 # Порядок отображения надписей: основная фаза, анализ, затем параллельные вложения
-PHASE_ORDER = ["transcribe", "analysis", "pdf", "ppt", "spreadsheets", "images", "documents"]
+PHASE_ORDER = ["transcribe", "analysis", "raw", "pdf", "ppt", "spreadsheets", "images", "documents"]
 
 
 def phase_label(phase: str) -> str:
@@ -95,10 +96,6 @@ class PhaseProgress:
             return min(100, round(total))
 
 
-# Обратная совместимость с прежним именем в web_panel
-_PhaseProgress = PhaseProgress
-
-
 class FilesProgress:
     """Агрегированный прогресс N параллельных файлов одной фазы.
 
@@ -131,6 +128,3 @@ class FilesProgress:
                 emit({"p": self._phase, "phase_progress": frac})
 
         return _on_progress
-
-
-_FilesProgress = FilesProgress

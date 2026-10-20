@@ -14,13 +14,12 @@
 """
 
 import hashlib
-import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from loguru import logger
 
-from src.analysis import _FragProgress
+from src.analysis import _FragProgress, finalize_conspect
 from src.attachments import COM_AVAILABLE
 from src.configuration import settings
 from src.database import get_cached_fragment, save_fragment_cache
@@ -30,10 +29,8 @@ from src.prompts import build_spreadsheet_prompt
 from src.utils import (
     MAX_LINE_CHARS,
     _chunk_hash,
-    _chunk_lines,
-    _footer_block,
-    _header_block,
     _truncate,
+    write_conspect,
 )
 
 # xlOpenXMLWorkbook — формат .xlsx для SaveAs через Excel COM
@@ -65,9 +62,6 @@ def _process_table_fragment(idx: int, total: int, chunk: list[str], source: str,
     text = plain_text(
         nim_client.send_prompt(
             build_spreadsheet_prompt(idx, total, source, body),
-            deepthink=False,
-            expert=False,
-            stable_rounds=6,
         )
     )
     save_fragment_cache(h, source, text)
@@ -204,6 +198,15 @@ def _process_single_spreadsheet(
         if progress:
             progress({"log": f"Таблица: извлекаю текст из {sheet.name}…"})
 
+        # Кэш ДО извлечения: прайсы с фантомными колонками и десятками тысяч
+        # строк разбирались openpyxl целиком даже при готовом консПЕКте в кэше.
+        h = hashlib.sha256(f"{sheet.name}|{sheet.stat().st_size}".encode("utf-8")).hexdigest()
+        text = get_cached_fragment(h)
+        if text:
+            return write_conspect(
+                sheet, plain_text(text), h, "КОНСПЕКТ ТАБЛИЦЫ", ".xlsx.txt", out_dir, progress
+            )
+
         if sheet.suffix.lower() == ".xls":
             source = _convert_xls_to_xlsx_via_com(sheet)
         else:
@@ -216,46 +219,14 @@ def _process_single_spreadsheet(
                 progress({"log": f"Таблица {sheet.name}: нет текста — пропускаю"})
             return []
 
-        h = hashlib.sha256(f"{sheet.name}|{sheet.stat().st_size}".encode("utf-8")).hexdigest()
-        text = get_cached_fragment(h)
-        n_fragments = 0
-
-        if not text:
-            budget = settings.nim_chunk_char_budget
-            chunks = _chunk_lines(lines, budget)
-            if not chunks:
-                return []
-            n_fragments = len(chunks)
-
-            if tracker is None:
-                tracker = _FragProgress("spreadsheets", 1.0, progress)
-            executor = ThreadPoolExecutor(max_workers=min(settings.nim_workers, len(chunks)))
-
-            futures = _submit_table_fragments(sheet.name, chunks, executor, tracker, progress)
-            executor.shutdown(wait=True)
-
-            texts = [fut.result() for fut in futures]
-            text = "\n\n".join(texts)
-            save_fragment_cache(h, "xlsx", text)
-        else:
-            text = plain_text(text)  # старый кэш мог быть с markdown-разметкой
-
-        target_dir = out_dir or settings.results_dir
-        target_dir.mkdir(parents=True, exist_ok=True)
-        out_path = target_dir / f"{sheet.stem}_{h[:8]}.xlsx.txt"
-        header = _header_block(
-            "КОНСПЕКТ ТАБЛИЦЫ",
-            [
-                ("Файл", sheet.name),
-                ("Фрагментов", n_fragments if n_fragments else None),
-                ("Дата", time.strftime("%d.%m.%Y %H:%M")),
-            ],
+        text = finalize_conspect(
+            sheet.name, lines, "spreadsheets", progress, tracker,
+            submit=_submit_table_fragments,
         )
-        out_path.write_text(header + text.strip() + "\n\n" + _footer_block("конспекта"), encoding="utf-8")
-        logger.info(f"Конспект таблицы готов: {out_path.name}")
-        if progress:
-            progress({"log": f"Конспект таблицы готов: {out_path.name}"})
-        return [out_path]
+        if text is None:
+            return []
+        save_fragment_cache(h, "xlsx", text)
+        return write_conspect(sheet, text, h, "КОНСПЕКТ ТАБЛИЦЫ", ".xlsx.txt", out_dir, progress)
     except RuntimeError as exc:
         # pywin32/Excel недоступны — сообщение уже человекочитаемое
         logger.error(f"Таблица {sheet.name}: {exc}")

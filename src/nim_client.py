@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import threading
 import time
@@ -14,6 +13,17 @@ NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 MAX_RETRIES = 5
+
+# --- Circuit breaker (по модели) -------------------------------------------
+# Сессия 16.10: vision-запросы умирали по 5 ретраев с таймаутами — до ~15-17
+# минут простоя на ОДИН файл, при живой текстовой модели. После серии
+# подряд неудачных запросов модель «выключается» на паузу: остальные
+# запросы к ней отказываются мгновенно (fast-fail), очередь продолжает
+# работать; неудачные файлы досчитываются как «не обработано» и
+# подхватываются при перезапуске задачи.
+BREAKER_THRESHOLD = 3        # подряд неудачных запросов -> открыть цепь
+BREAKER_COOLDOWN = 90.0      # сек первичной паузы
+BREAKER_COOLDOWN_MAX = 600.0  # потолок прогрессивной паузы
 
 # Расширения файлов-картинок: только их присутствие во вложениях переключает
 # запрос на vision-модель. Документы (pdf/docx/xlsx/…) вкладываются как
@@ -62,6 +72,9 @@ class NimClient:
         self._reset_after: float | None = None
         self._sync_client: Optional[httpx.Client] = None
         self._client_lock = threading.Lock()
+        # Состояние breaker'а: model -> {"failures": int, "open_until": float}
+        self._breaker: dict[str, dict] = {}
+        self._breaker_lock = threading.Lock()
 
     @property
     def model(self) -> str:
@@ -261,16 +274,11 @@ class NimClient:
                 elif ext in (".txt", ".csv"):
                     text = path.read_text(encoding="utf-8", errors="ignore")
                 elif ext == ".docx":
-                    from docx import Document
+                    from src.raw_extract import extract_docx_text
 
-                    doc = Document(str(path))
-                    parts = [par.text for par in doc.paragraphs if par.text.strip()]
-                    for table in doc.tables:
-                        for row in table.rows:
-                            cells = [c.text.strip() for c in row.cells]
-                            if any(cells):
-                                parts.append(" | ".join(cells))
-                    text = "\n".join(parts)
+                    # Общий извлекатель с raw-режимом (абзацы + таблицы):
+                    # раньше — вторая копия той же логики
+                    text = extract_docx_text(path)
                 elif ext in (".xlsx", ".xlsm"):
                     from openpyxl import load_workbook
 
@@ -347,12 +355,50 @@ class NimClient:
         return [{"role": "user", "content": content}]
 
     # ------------------------------------------------------------------
+    # Circuit breaker: fast-fail для модели после серии сбоев
+    # ------------------------------------------------------------------
+
+    def _breaker_check(self, model: str) -> None:
+        """Запрос к модели с открытой цепью отклоняется мгновенно."""
+        with self._breaker_lock:
+            state = self._breaker.get(model)
+            if state and state["open_until"] > time.time():
+                wait = state["open_until"] - time.time()
+                raise NimError(
+                    f"NIM: модель {model} на паузе после серии сбоев "
+                    f"(breaker, ещё {wait:.0f} с) — быстрый отказ"
+                )
+
+    def _breaker_record_failure(self, model: str) -> None:
+        """Логический запрос исчерпал ретраи — копим серию, открываем цепь."""
+        with self._breaker_lock:
+            state = self._breaker.setdefault(model, {"failures": 0, "open_until": 0.0})
+            state["failures"] += 1
+            if state["failures"] >= BREAKER_THRESHOLD:
+                # Прогрессивная пауза: 90с -> 180с -> ... до потолка
+                cooldown = min(
+                    BREAKER_COOLDOWN_MAX,
+                    BREAKER_COOLDOWN * (2 ** (state["failures"] - BREAKER_THRESHOLD)),
+                )
+                state["open_until"] = time.time() + cooldown
+                logger.warning(
+                    f"NIM: {state['failures']} неудач подряд у {model} — "
+                    f"breaker открыт на {cooldown:.0f} с (остальные запросы "
+                    f"к модели будут отказывать мгновенно)"
+                )
+
+    def _breaker_record_success(self, model: str) -> None:
+        with self._breaker_lock:
+            self._breaker[model] = {"failures": 0, "open_until": 0.0}
+
+    # ------------------------------------------------------------------
     # Один логический запрос (с ретраями) -> (text, finish_reason)
     # ------------------------------------------------------------------
 
     def _post_chat(self, messages: list, chosen: str, log_prefix: str = "NIM") -> tuple[str, str]:
         if not settings.nim_api_key:
             raise NimError("NIM_API_KEY не задан в .env — добавьте ключ с build.nvidia.com")
+        self._breaker_check(chosen)
         payload = {
             "model": chosen,
             "messages": messages,
@@ -385,6 +431,7 @@ class NimClient:
                 except (KeyError, IndexError, ValueError) as exc:
                     raise NimError(f"NIM: неожиданный формат ответа: {exc}")
                 logger.info(f"{log_prefix}: ответ получен ({len(text)} симв., finish={finish or 'stop'})")
+                self._breaker_record_success(chosen)
                 return text, finish
 
             if response.status_code in RETRYABLE_STATUS:
@@ -402,6 +449,7 @@ class NimClient:
                 detail = response.text[:300]
             raise NimError(f"NIM: HTTP {response.status_code}: {detail[:500]}")
 
+        self._breaker_record_failure(chosen)
         raise NimError(f"NIM: не удалось получить ответ после {MAX_RETRIES} попыток. {last_error}")
 
     def _complete_with_continuation(self, messages: list, chosen: str, log_prefix: str = "NIM") -> tuple[str, str]:
@@ -440,10 +488,7 @@ class NimClient:
     def send_prompt(
         self,
         prompt: str,
-        deepthink: bool = True,
-        expert: bool = True,
         attachments: list[str] | None = None,
-        stable_rounds: int = 12,
         model: str | None = None,
     ) -> str:
         messages = self._build_messages(prompt, attachments)
@@ -459,31 +504,6 @@ class NimClient:
         if finish == "length":
             text = text + TRUNCATED_MARKER
         return text.strip()
-
-    async def send_prompt_async(
-        self,
-        prompt: str,
-        deepthink: bool = True,
-        expert: bool = True,
-        attachments: list[str] | None = None,
-        stable_rounds: int = 12,
-        model: str | None = None,
-    ) -> str:
-        """Асинхронная обёртка над синхронным клиентом.
-
-        Синхронный путь теперь единственный: общий keep-alive пул + rate limit
-        + автопродолжение. Дублировать логику в AsyncClient не нужно —
-        поток берётся из пула asyncio.to_thread, блокируя только его.
-        """
-        return await asyncio.to_thread(
-            self.send_prompt,
-            prompt,
-            deepthink,
-            expert,
-            attachments,
-            stable_rounds,
-            model,
-        )
 
 
 client = NimClient()

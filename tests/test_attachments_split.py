@@ -220,5 +220,40 @@ class TestOcrCacheVersion:
         assert "OCR КАРТИНОК" in text
 
 
+class TestBatchCounterEvent:
+    """Счётчик «N из M» в событиях фазы: при тысячах батчей целые проценты
+    долго показывают 0% — счётчик показывает, что очередь движется."""
+
+    def test_progress_events_carry_done_total(self, cfg, no_cache, monkeypatch, tmp_path):
+        monkeypatch.setattr(att.nim_client, "send_prompt", lambda prompt, **kw: "текста нет")
+        files = [tmp_path / f"p{i}.jpg" for i in range(4)]
+        for p in files:
+            p.write_bytes(b"jpg")
+
+        events: list[dict] = []
+        cfg.nim_images_per_batch = 2  # батчи по 2 → 2 батча
+        att.run_attachments(files, "images", {"images": 10}, tmp_path / "out", events.append)
+
+        counters = [
+            (e["done"], e["total"])
+            for e in events
+            if e.get("p") == "images" and "done" in e
+        ]
+        assert counters == [(1, 2), (2, 2)], f"счётчик должен расти по завершении батчей: {counters}"
+        # парные события всегда с phase_progress
+        assert all("phase_progress" in e for e in events if e.get("p") == "images" and "done" in e)
+
+    def test_single_batch_carries_done_total(self, cfg, no_cache, monkeypatch, tmp_path):
+        monkeypatch.setattr(att.nim_client, "send_prompt", lambda prompt, **kw: "текста нет")
+        f = tmp_path / "p.jpg"
+        f.write_bytes(b"jpg")
+
+        events: list[dict] = []
+        att.run_attachments([f], "images", {"images": 10}, tmp_path / "out", events.append)
+
+        counters = [(e["done"], e["total"]) for e in events if e.get("p") == "images" and "done" in e]
+        assert counters == [(1, 1)]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

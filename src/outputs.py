@@ -1,7 +1,10 @@
 """Выходные файлы задачи: сбор списка, ZIP-архив, plain-text санитайзер LLM-ответов."""
 
-import io
+import json
+import os
 import re
+import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -13,8 +16,9 @@ from pathlib import Path
 def collect_job_files(result: dict) -> list[dict]:
     """Собрать уникальные выходные файлы из результата run_pipeline.
 
-    Порядок: общий отчёт → транскрипты → отчёты вложений (картинки/PDF/документы).
-    Возвращает [{"name": ..., "path": ...}, ...] без дубликатов.
+    Порядок: общий отчёт → транскрипты → raw-извлечения → отчёты вложений
+    (картинки/PDF/документы). Возвращает [{"name": ..., "path": ...}, ...]
+    без дубликатов.
     """
     ordered: list[Path] = []
     report = result.get("report")
@@ -22,6 +26,8 @@ def collect_job_files(result: dict) -> list[dict]:
         ordered.append(Path(report))
     for t in result.get("transcripts") or []:
         ordered.append(Path(t))
+    for r in result.get("raw_files") or []:
+        ordered.append(Path(r))
     for r in result.get("image_reports") or []:
         ordered.append(Path(r))
 
@@ -37,18 +43,33 @@ def collect_job_files(result: dict) -> list[dict]:
 
 
 def _classify_arcname(name: str) -> str:
-    """Относительный путь внутри ZIP по имени файла.
+    """Относительный путь внутри ZIP: двухуровневое дерево категорий
+    (стадия обработки -> тип источника).
 
-    - *.transcript.txt          → transcripts/<имя>
-    - *.pdf.txt / *.images.txt / *.documents.txt / *.ppt.txt / *.xlsx.txt / *.xls.txt
-      / *_scan_*.txt            → summaries/<имя>
-    - прочее (report_*.txt)     → <имя> (корень архива)
+    Первичная обработка — сырой извлечённый текст (транскрипты, OCR картинок
+    и сканов). Вторичная — консПЕКТы NIM и распознанные документы. Отчёт —
+    отдельно. Raw-извлечение (файлы режима «без NIM») — в собственной папке
+    верхнего уровня, отдельно от остальных результатов. Неопознанное — «прочее».
     """
-    if name.endswith(".transcript.txt"):
-        return f"transcripts/{name}"
-    if name.endswith((".pdf.txt", ".images.txt", ".documents.txt", ".ppt.txt", ".xlsx.txt", ".xls.txt")) or "_scan_" in name:
-        return f"summaries/{name}"
-    return name
+    if name.endswith((".transcript.txt", ".transcript.md")):
+        return f"первичная обработка/транскрипты/{name}"
+    if name.endswith(".raw.txt"):
+        return f"raw-извлечение/{name}"
+    if name.endswith(".images.txt"):
+        return f"первичная обработка/картинки OCR/{name}"
+    if "_scan_" in name and name.endswith(".txt"):
+        return f"первичная обработка/сканы PDF OCR/{name}"
+    if name.endswith(".pdf.txt"):
+        return f"вторичная обработка/конспекты PDF/{name}"
+    if name.endswith(".ppt.txt"):
+        return f"вторичная обработка/конспекты презентаций/{name}"
+    if name.endswith((".xlsx.txt", ".xls.txt")):
+        return f"вторичная обработка/конспекты таблиц/{name}"
+    if name.endswith(".documents.txt"):
+        return f"вторичная обработка/распознанные документы/{name}"
+    if name.startswith("report_") and name.endswith(".txt"):
+        return f"отчёты/{name}"
+    return f"прочее/{name}"
 
 
 def _unique_arcname(arc: str, seen: set) -> str:
@@ -67,21 +88,61 @@ def _unique_arcname(arc: str, seen: set) -> str:
         i += 1
 
 
-def build_zip_bytes(files: list[dict]) -> bytes:
-    """Собрать ZIP из списка [{"name","path"}, ...] в памяти.
+# ---------------------------------------------------------------------------
+# Кэшированный ZIP на диске: большие задачи (11k+ файлов) собираются
+# синхронно ~10-60 с — собираем ОДИН раз (в фоне после завершения задачи),
+# повторные скачивания отдают готовый файл мгновенно.
+# ---------------------------------------------------------------------------
 
-    Несуществующие файлы пропускаются. Имена внутри архива уникальны.
+def build_zip_to_file(files: list[dict], dest: Path) -> tuple[Path, int]:
+    """Собрать архив прямо в файл (без буфера в памяти), атомарно.
+
+    compresslevel=1: сборка ~2x быстрее дефолта, архив чуть больше —
+    для кэшируемого архива скорость важнее степени сжатия.
+    Возвращает (путь, число файлов в архиве).
     """
-    buf = io.BytesIO()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # Уникальный tmp: параллельные сборки одной задачи не затирают друг друга
+    tmp = dest.with_name(f"{dest.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    count = 0
     seen: set = set()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for item in files:
-            p = Path(item["path"])
-            if not p.is_file():
-                continue
-            arc = _unique_arcname(_classify_arcname(p.name), seen)
-            zf.write(p, arc)
-    return buf.getvalue()
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+            for item in files:
+                p = Path(item["path"])
+                if not p.is_file():
+                    continue
+                arc = _unique_arcname(_classify_arcname(p.name), seen)
+                zf.write(p, arc)
+                count += 1
+        os.replace(tmp, dest)  # атомарно: читатель видит либо старый, либо новый
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    sidecar = dest.with_suffix(".json")
+    sidecar.write_text(
+        json.dumps({"files": count, "built_at": int(time.time())}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return dest, count
+
+
+def get_or_build_zip(files: list[dict], dest: Path) -> Path | None:
+    """Отдать кэшированный архив или собрать. Пересборка — только если
+    число существующих файлов изменилось (дозапуск задачи добавил файлы)."""
+    expected = sum(1 for item in files if Path(item["path"]).is_file())
+    sidecar = dest.with_suffix(".json")
+    if dest.is_file() and sidecar.is_file():
+        try:
+            meta = json.loads(sidecar.read_text(encoding="utf-8"))
+            if meta.get("files") == expected:
+                return dest
+        except (ValueError, OSError):
+            pass
+    if expected == 0:
+        return None
+    build_zip_to_file(files, dest)
+    return dest
 
 
 # ---------------------------------------------------------------------------

@@ -83,6 +83,16 @@ class Settings:
     # q85): большие фото приводили к ReadTimeout на vision-модели.
     nim_image_max_bytes: int = _as_int("NIM_IMAGE_MAX_BYTES", 3_000_000)
 
+    # Движок OCR картинок и страниц сканов:
+    #   nim      — LLM-vision NIM (как раньше; сеть, лимиты RPM, таймауты);
+    #   rapidocr — локальный onnxruntime-OCR (без сети и лимитов, PP-OCRv5
+    #              cyrillic). Пакет rapidocr должен быть установлен.
+    ocr_engine: str = os.getenv("OCR_ENGINE", "nim").strip().lower()
+    # Потоки локального OCR (onnxruntime отпускает GIL в Run())
+    ocr_workers: int = _as_int("OCR_WORKERS", 4)
+    # Порог уверенности бокса локального OCR (0..1): ниже — отсев мусора
+    ocr_min_confidence: float = _as_float("OCR_MIN_CONFIDENCE", 0.5)
+
     # Пути
     base_dir: Path = Path(__file__).resolve().parent.parent
     data_dir: Path = base_dir / "data"

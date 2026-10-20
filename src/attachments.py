@@ -5,15 +5,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from loguru import logger
-from pypdf import PdfReader
 
 from src.configuration import settings
 from src.database import get_cached_fragment, save_fragment_cache
 from src.nim_client import NimError, client as nim_client
 from src.outputs import plain_text
 from src.prompts import build_documents_prompt, build_images_prompt
-from src.utils import _chunk_lines, _footer_block, _header_block, MAX_LINE_CHARS
-from src.analysis import _FragProgress, _submit_fragments
+from src.utils import _footer_block, _header_block, MAX_LINE_CHARS, write_conspect
+from src.analysis import _FragProgress, finalize_conspect
+from src import ocr as local_ocr
 
 try:
     from pdf2image import convert_from_path
@@ -39,6 +39,44 @@ PP_SAVE_AS_OPEN_XML = 24  # ppSaveAsOpenXMLPresentation
 OCR_CACHE_VERSION = "ocr-v2"
 
 
+# --- локальный OCR (OCR_ENGINE=rapidocr) ------------------------------------
+
+_local_ocr_warned = False
+
+
+def _local_ocr_active() -> bool:
+    """Включён ли локальный OCR. Если включён, но пакет rapidocr не
+    установлен — предупреждение один раз и fallback на NIM-vision путь."""
+    global _local_ocr_warned
+    if getattr(settings, "ocr_engine", "nim") != "rapidocr":
+        return False
+    if not local_ocr.RAPIDOCR_AVAILABLE:
+        if not _local_ocr_warned:
+            logger.warning(
+                "OCR_ENGINE=rapidocr, но пакет rapidocr не установлен — "
+                "используется NIM-vision (pip install rapidocr)"
+            )
+            _local_ocr_warned = True
+        return False
+    return True
+
+
+def _local_ocr_batch_text(batch: list[Path]) -> str:
+    """OCR картинок локальным движком, формат как у NIM-промпта
+    («Картинка N:» + текст) — выходной файл идентичен обоим путям."""
+    workers = getattr(settings, "ocr_workers", None)
+    min_conf = getattr(settings, "ocr_min_confidence", None)
+    texts = local_ocr.ocr_images_parallel(
+        batch,
+        workers=workers,
+        min_confidence=min_conf if min_conf is not None else local_ocr.DEFAULT_MIN_CONFIDENCE,
+    )
+    parts = []
+    for i, t in enumerate(texts, 1):
+        parts.append(f"Картинка {i}:\n{t.strip() or 'текста нет'}")
+    return "\n\n".join(parts)
+
+
 def _cache_hash(kind: str, batch: list[Path]) -> str:
     """Хэш кэша батча. Для картинок — с версией OCR-промпта: старые
     кэшированные описания сцен не должны подменять новые OCR-результаты."""
@@ -53,7 +91,9 @@ def _pdf_to_images(pdf: Path, dpi: int = 200) -> list[Path]:
 
     Имена вида `{hash}_0001.png` (номер страницы внутри имени) делают ключ
     кэша Vision-батча одинаковым между перезапусками: упавшие в прошлый раз
-    страницы дораспознаются, а удачные возьмутся из кэша.
+    страницы дораспознаются, а удачные возьмутся из кэша. Уже отрендеренные
+    страницы НЕ перерисовываются: раньше poppler рендерил все страницы
+    заново при каждом запуске (сотни страниц сканов — минуты впустую).
     """
     if not PDF2IMAGE_AVAILABLE:
         raise RuntimeError("pdf2image не установлен")
@@ -63,6 +103,20 @@ def _pdf_to_images(pdf: Path, dpi: int = 200) -> list[Path]:
     key = hashlib.sha256(f"{pdf.name}|{pdf.stat().st_size}".encode("utf-8")).hexdigest()[:8]
     prefix = f"{pdf.stem}_{key}_"
     settings.tmp_pdfs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Число страниц — только метаданные, без разбора содержимого
+    page_count = 0
+    try:
+        from pypdf import PdfReader
+
+        page_count = len(PdfReader(str(pdf)).pages)
+    except Exception:
+        page_count = 0
+
+    expected = [settings.tmp_pdfs_dir / f"{prefix}{i:04d}.png" for i in range(1, page_count + 1)]
+    if page_count and all(p.exists() for p in expected):
+        return expected
+
     with tempfile.TemporaryDirectory() as tmpdir:
         images = convert_from_path(
             str(pdf),
@@ -90,11 +144,12 @@ def _recognize_scan_batch(
     out_dir: Path | None,
     progress,
 ) -> Path:
-    """Распознать один батч страниц скана через Vision-модель, записать .txt.
+    """Распознать один батч страниц скана, записать .txt.
 
-    Страницы скана — тоже картинки: обрабатываются OCR-промптом (только
-    текст, без описания сцены), кэш — с версией OCR-промпта.
-    Бросает NimError наружу — изоляция сбоев решает вызывающая сторона.
+    Страницы скана — тоже картинки: обрабатываются OCR (только текст, без
+    описания сцены), кэш — с версией OCR-промпта. Движок — локальный
+    (OCR_ENGINE=rapidocr) или NIM-vision; NimError бросается наружу —
+    изоляция сбоев решает вызывающая сторона.
     """
     # Кэш для этого батча: стабильные имена страниц -> попадает и при перезапуске
     key = "|".join(f"{p.name}:{p.stat().st_size}" for p in batch)
@@ -102,16 +157,26 @@ def _recognize_scan_batch(
     text = get_cached_fragment(h)
 
     if not text:
-        prompt = build_images_prompt(len(batch))
-        text = plain_text(
-            nim_client.send_prompt(
-                prompt,
-                deepthink=False,
-                expert=False,
-                stable_rounds=6,
-                attachments=[str(p.resolve()) for p in batch],
+        if _local_ocr_active():
+            workers = getattr(settings, "ocr_workers", None)
+            min_conf = getattr(settings, "ocr_min_confidence", None)
+            texts = local_ocr.ocr_images_parallel(
+                batch,
+                workers=workers,
+                min_confidence=min_conf if min_conf is not None else local_ocr.DEFAULT_MIN_CONFIDENCE,
             )
-        )
+            parts = []
+            for i, t in enumerate(texts):
+                parts.append(f"[Страница {first_page + i}]\n{t.strip() or 'текста нет'}")
+            text = "\n\n".join(parts)
+        else:
+            prompt = build_images_prompt(len(batch))
+            text = plain_text(
+                nim_client.send_prompt(
+                    prompt,
+                    attachments=[str(p.resolve()) for p in batch],
+                )
+            )
         save_fragment_cache(h, "pdf_scan", text)
     else:
         text = plain_text(text)  # старый кэш мог быть с markdown-разметкой
@@ -233,16 +298,17 @@ def _process_attachment_batch(batch: list[Path], kind: str, out_dir: Path | None
     h = _cache_hash(kind, batch)
     text = get_cached_fragment(h)
     if not text:
-        prompt = build_images_prompt(len(batch)) if kind == "images" else build_documents_prompt(len(batch))
-        text = plain_text(
-            nim_client.send_prompt(
-                prompt,
-                deepthink=False,
-                expert=False,
-                stable_rounds=6,
-                attachments=[str(p.resolve()) for p in batch],
+        if kind == "images" and _local_ocr_active():
+            # Локальный OCR: без сети, лимитов и таймаутов NIM
+            text = _local_ocr_batch_text(batch)
+        else:
+            prompt = build_images_prompt(len(batch)) if kind == "images" else build_documents_prompt(len(batch))
+            text = plain_text(
+                nim_client.send_prompt(
+                    prompt,
+                    attachments=[str(p.resolve()) for p in batch],
+                )
             )
-        )
         save_fragment_cache(h, kind, text)
     else:
         text = plain_text(text)  # старый кэш мог быть с markdown-разметкой
@@ -268,6 +334,49 @@ def _process_attachment_batch(batch: list[Path], kind: str, out_dir: Path | None
 _MANY_IMAGES_MARK = "At most 1 image"
 
 
+def _process_batch_safe(
+    batch: list[Path],
+    kind: str,
+    weights: dict,
+    out_dir: Path | None,
+    progress,
+    stats: dict | None,
+    label: str,
+) -> list[Path]:
+    """Один батч с изоляцией сбоев: split по «At most 1 image», половинание
+    при иных сбоях, счёт потерянных файлов. Ошибки НИКОГДА не выходят наружу —
+    упавший батч не останавливает очередь остальных."""
+    try:
+        return [_process_attachment_batch(batch, kind, out_dir)]
+    except NimError as exc:
+        msg = str(exc)
+        if _MANY_IMAGES_MARK in msg and len(batch) > 1:
+            logger.warning(
+                f"{label}: модель принимает 1 картинку за запрос — "
+                f"батч ({len(batch)} шт.) обрабатываю по одной"
+            )
+            if progress:
+                progress({"log": f"{label}: модель принимает 1 картинку за запрос — батч по одной"})
+            results: list[Path] = []
+            for single in batch:
+                results += _process_batch_safe([single], kind, weights, out_dir, progress, stats, label)
+            return results
+        if len(batch) > 1:
+            logger.warning(f"Батч не прошёл ({exc}) — режу пополам и повторяю")
+            if progress:
+                progress({"log": "Батч не прошёл — режу батч пополам"})
+            mid = len(batch) // 2
+            results = _process_batch_safe(batch[:mid], kind, weights, out_dir, progress, stats, label)
+            results += _process_batch_safe(batch[mid:], kind, weights, out_dir, progress, stats, label)
+            return results
+        logger.error(f"{label[:-1]} {batch[0].name}: ошибка {exc}")
+        if progress:
+            progress({"log": f"Ошибка: {batch[0].name} — {exc}"})
+        if stats is not None:
+            stats["failed"] = stats.get("failed", 0) + 1
+        return []
+
+
 def run_attachments(
     files: list[Path],
     kind: str,
@@ -288,47 +397,49 @@ def run_attachments(
     if progress and not quiet:
         progress({"phase": kind, "weight": weights.get(kind, 0)})
 
+    total = len(batches)
     results: list[Path] = []
-    for bi, batch in enumerate(batches, 1):
+
+    def _run(indexed: tuple[int, list[Path]]) -> list[Path]:
+        bi, batch = indexed
         if progress and not quiet:
-            # Событие батча: без полей file_index/file_total — счётчик «Файл n
-            # из N» в UI показывается только для файловых фаз (транскрибация,
-            # PDF, презентации), у батчей свой прогресс в тексте.
-            # Имя без префикса фазы: метку («Картинки»/«Документы») добавляет UI/CLI
-            progress({"file": f"батч {bi} из {len(batches)} ({len(batch)} шт.)", "phase": kind})
+            progress({"file": f"батч {bi} из {total} ({len(batch)} шт.)", "phase": kind})
         if progress:
-            progress({"log": f"{label}: батч {bi}/{len(batches)} ({len(batch)} шт.)…"})
-        try:
-            results.append(_process_attachment_batch(batch, kind, out_dir))
-            if progress:
-                progress({"p": kind, "phase_progress": bi / len(batches)})
-        except NimError as exc:
-            msg = str(exc)
-            if _MANY_IMAGES_MARK in msg and len(batch) > 1:
-                logger.warning(
-                    f"{label}: модель принимает 1 картинку за запрос — "
-                    f"батч {bi} ({len(batch)} шт.) обрабатываю по одной"
-                )
-                if progress:
-                    progress({"log": f"{label}: модель принимает 1 картинку за запрос — батч {bi} по одной"})
-                for single in batch:
-                    results += run_attachments(
-                        [single], kind, weights, out_dir, progress, True, stats
-                    )
-                continue
-            if len(batch) > 1:
-                logger.warning(f"Батч {bi} не прошёл ({exc}) — режу пополам и повторяю")
-                if progress:
-                    progress({"log": f"Батч {bi} не прошёл — режу батч пополам"})
-                mid = len(batch) // 2
-                results += run_attachments(batch[:mid], kind, weights, out_dir, progress, True, stats)
-                results += run_attachments(batch[mid:], kind, weights, out_dir, progress, True, stats)
-            else:
-                logger.error(f"{label[:-1]} {batch[0].name}: ошибка {exc}")
-                if progress:
-                    progress({"log": f"Ошибка: {batch[0].name} — {exc}"})
-                if stats is not None:
-                    stats["failed"] = stats.get("failed", 0) + 1
+            progress({"log": f"{label}: батч {bi}/{total} ({len(batch)} шт.)…"})
+        return _process_batch_safe(batch, kind, weights, out_dir, progress, stats, label)
+
+    if total == 1:
+        results += _run((1, batches[0]))
+        if progress:
+            # done/total — для счётчика «N из M» в строке фазы веб-панели
+            progress({"p": kind, "phase_progress": 1.0, "done": 1, "total": 1})
+        return results
+
+    # Параллельная обработка батчей: раньше — строго по одному, и один
+    # зависший файл (ReadTimeout ~15 мин) тормозил всю очередь из тысяч.
+    # Доля фазы — по ЗАВЕРШЁННЫМ батчам (счётчик под локом: монотонно).
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    done_lock = threading.Lock()
+    done = 0
+
+    def _run_tracked(indexed: tuple[int, list[Path]]) -> list[Path]:
+        nonlocal done
+        res = _run(indexed)
+        with done_lock:
+            done += 1
+            frac = done / total
+        if progress:
+            # done/total — счётчик «N из M» в строке фазы: при тысячах батчей
+            # целые проценты долго показывают 0%, и непонятно, движется ли очередь
+            progress({"p": kind, "phase_progress": frac, "done": done, "total": total})
+        return res
+
+    workers = max(1, min(settings.nim_workers if settings.nim_workers > 0 else 1, total))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for res in executor.map(_run_tracked, enumerate(batches, 1)):
+            results += res
     return results
 
 
@@ -340,13 +451,10 @@ def _process_single_pdf(
     quiet: bool,
     tracker: "_FragProgress | None" = None,
 ) -> list[Path]:
-    """Process a single PDF file.
+    """Конспект одного PDF (общий MAP-пайплайн: finalize_conspect).
 
     tracker — ОБЩИЙ на всю фазу (создаётся в run_pdfs): доля фазы считается
     по всем фрагментам всех файлов, а не сбрасывается на каждый файл.
-    Раньше у каждого PDF был свой трекер, и после завершения первого файла
-    фаза навсегда показывала 100% (монотонность игнорировала откат к 0
-    следующего файла).
     """
     try:
         if progress and not quiet:
@@ -354,61 +462,49 @@ def _process_single_pdf(
         if progress:
             progress({"log": f"PDF: извлекаю текст из {pdf.name}…"})
 
-        from pypdf import PdfReader
-        reader = PdfReader(str(pdf))
-        lines = []
-        for page in reader.pages:
-            text = (page.extract_text() or "").strip()
-            if text:
-                lines.append(text[:500])
+        # Кэш ДО извлечения текста: раньше PdfReader перемалывал ВСЕ страницы
+        # (сканы — десятки секунд) даже для уже обработанных файлов.
+        h = hashlib.sha256(f"{pdf.stem}.pdf|{pdf.stat().st_size}".encode("utf-8")).hexdigest()
+        text = get_cached_fragment(h)
+        if text:
+            return write_conspect(
+                pdf, plain_text(text), h, "КОНСПЕКТ PDF", ".pdf.txt", out_dir, progress
+            )
 
+        # Маркер «это скан»: скан не кэшируется под h (его консПЕКТ —
+        # постраничный OCR с собственными ключами), поэтому без маркера
+        # каждый запуск заново перемалывал страницы перед Vision fallback.
+        if get_cached_fragment(f"{h}|scan"):
+            if progress:
+                progress({"log": f"PDF {pdf.name}: скан (из кэша) — Vision fallback…"})
+            return _process_pdf_as_images(pdf, weights, progress, out_dir, quiet)
+
+        def _extract_lines() -> list[str]:
+            from pypdf import PdfReader
+
+            reader = PdfReader(str(pdf))
+            lines = []
+            for page in reader.pages:
+                t = (page.extract_text() or "").strip()
+                if t:
+                    lines.append(t[:500])
+            return lines
+
+        lines = _extract_lines()
         if not lines:
             logger.warning(f"PDF {pdf.name}: текст не извлечён — пробуем Vision fallback")
             if progress:
                 progress({"log": f"PDF {pdf.name}: нет текстового слоя — Vision fallback…"})
+            # Запоминаем скан-верdict: следующий запуск не будет заново
+            # извлекать текст из всех страниц
+            save_fragment_cache(f"{h}|scan", "pdf_scan_marker", "1")
             return _process_pdf_as_images(pdf, weights, progress, out_dir, quiet)
 
-        # Check cache
-        h = hashlib.sha256(f"{pdf.stem}.pdf|{pdf.stat().st_size}".encode("utf-8")).hexdigest()
-        text = get_cached_fragment(h)
-
-        if not text:
-            budget = settings.nim_chunk_char_budget
-            chunks = _chunk_lines(lines, budget)
-            if not chunks:
-                return []
-
-            from concurrent.futures import ThreadPoolExecutor
-
-            if tracker is None:
-                tracker = _FragProgress("pdf", 1.0, progress)
-            executor = ThreadPoolExecutor(max_workers=min(settings.nim_workers, len(chunks)))
-
-            futures = _submit_fragments(f"{pdf.stem}.pdf", chunks, executor, tracker, progress)
-            executor.shutdown(wait=True)
-
-            texts = [fut.result() for fut in futures]
-            text = "\n\n".join(texts)
-            save_fragment_cache(h, "pdf", text)
-        else:
-            text = plain_text(text)  # старый кэш мог быть с markdown-разметкой
-        
-        target_dir = out_dir or settings.results_dir
-        target_dir.mkdir(parents=True, exist_ok=True)
-        out_path = target_dir / f"{pdf.stem}_{h[:8]}.pdf.txt"
-        header = _header_block(
-            "КОНСПЕКТ PDF",
-            [
-                ("Документ", pdf.name),
-                ("Фрагментов", len(text.split("\n\n")) if text else 0),
-                ("Дата", time.strftime("%d.%m.%Y %H:%M")),
-            ],
-        )
-        out_path.write_text(header + text.strip() + "\n\n" + _footer_block("конспекта"), encoding="utf-8")
-        logger.info(f"Конспект PDF готов: {out_path.name}")
-        if progress:
-            progress({"log": f"Конспект PDF готов: {out_path.name}"})
-        return [out_path]
+        text = finalize_conspect(f"{pdf.stem}.pdf", lines, "pdf", progress, tracker)
+        if text is None:
+            return []
+        save_fragment_cache(h, "pdf", text)
+        return write_conspect(pdf, text, h, "КОНСПЕКТ PDF", ".pdf.txt", out_dir, progress)
     except NimError as exc:
         logger.error(f"PDF {pdf.name}: ошибка {exc}")
         if progress:
@@ -546,7 +642,7 @@ def _process_single_presentation(
     quiet: bool,
     tracker: "_FragProgress | None" = None,
 ) -> list[Path]:
-    """Конспект одной презентации (.pptx/.ppt) — по аналогии с _process_single_pdf.
+    """Конспект одной презентации (.pptx/.ppt) — общий MAP-пайплайн.
 
     tracker — общий на всю фазу (см. комментарий в _process_single_pdf).
     """
@@ -556,57 +652,32 @@ def _process_single_presentation(
         if progress:
             progress({"log": f"Презентация: извлекаю текст из {ppt.name}…"})
 
-        if ppt.suffix.lower() == ".pptx":
-            lines = _extract_pptx_lines(ppt)
-        else:
-            lines = _extract_pptx_lines(_convert_ppt_to_pptx_via_com(ppt))
+        # Кэш ДО извлечения: раньше .ppt прогонялся через COM-конвертацию и
+        # .pptx разбирался целиком даже при готовом консПЕКте в кэше.
+        h = hashlib.sha256(f"{ppt.name}|{ppt.stat().st_size}".encode("utf-8")).hexdigest()
+        text = get_cached_fragment(h)
+        if text:
+            return write_conspect(
+                ppt, plain_text(text), h, "КОНСПЕКТ ПРЕЗЕНТАЦИИ", ".ppt.txt", out_dir, progress
+            )
 
+        def _extract_lines() -> list[str]:
+            if ppt.suffix.lower() == ".pptx":
+                return _extract_pptx_lines(ppt)
+            return _extract_pptx_lines(_convert_ppt_to_pptx_via_com(ppt))
+
+        lines = _extract_lines()
         if not lines:
             logger.warning(f"Презентация {ppt.name}: текст не извлечён (слайды без текста)")
             if progress:
                 progress({"log": f"Презентация {ppt.name}: нет текста — пропускаю (рендер слайдов не поддерживается)"})
             return []
 
-        h = hashlib.sha256(f"{ppt.name}|{ppt.stat().st_size}".encode("utf-8")).hexdigest()
-        text = get_cached_fragment(h)
-
-        if not text:
-            budget = settings.nim_chunk_char_budget
-            chunks = _chunk_lines(lines, budget)
-            if not chunks:
-                return []
-
-            from concurrent.futures import ThreadPoolExecutor
-
-            if tracker is None:
-                tracker = _FragProgress("ppt", 1.0, progress)
-            executor = ThreadPoolExecutor(max_workers=min(settings.nim_workers, len(chunks)))
-
-            futures = _submit_fragments(ppt.name, chunks, executor, tracker, progress)
-            executor.shutdown(wait=True)
-
-            texts = [fut.result() for fut in futures]
-            text = "\n\n".join(texts)
-            save_fragment_cache(h, "ppt", text)
-        else:
-            text = plain_text(text)  # старый кэш мог быть с markdown-разметкой
-
-        target_dir = out_dir or settings.results_dir
-        target_dir.mkdir(parents=True, exist_ok=True)
-        out_path = target_dir / f"{ppt.stem}_{h[:8]}.ppt.txt"
-        header = _header_block(
-            "КОНСПЕКТ ПРЕЗЕНТАЦИИ",
-            [
-                ("Документ", ppt.name),
-                ("Фрагментов", len(text.split("\n\n")) if text else 0),
-                ("Дата", time.strftime("%d.%m.%Y %H:%M")),
-            ],
-        )
-        out_path.write_text(header + text.strip() + "\n\n" + _footer_block("конспекта"), encoding="utf-8")
-        logger.info(f"Конспект презентации готов: {out_path.name}")
-        if progress:
-            progress({"log": f"Конспект презентации готов: {out_path.name}"})
-        return [out_path]
+        text = finalize_conspect(ppt.name, lines, "ppt", progress, tracker)
+        if text is None:
+            return []
+        save_fragment_cache(h, "ppt", text)
+        return write_conspect(ppt, text, h, "КОНСПЕКТ ПРЕЗЕНТАЦИИ", ".ppt.txt", out_dir, progress)
     except RuntimeError as exc:
         # pywin32/PowerPoint недоступны — сообщение уже человекочитаемое
         logger.error(f"Презентация {ppt.name}: {exc}")

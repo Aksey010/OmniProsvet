@@ -1,6 +1,8 @@
 import hashlib
+import time
 from pathlib import Path
-from typing import Any
+
+from loguru import logger
 
 from src.configuration import settings
 
@@ -92,3 +94,32 @@ def _is_small_chunk(chunk: list[str], budget: int | None = None) -> bool:
         size <= b // 2
         and len(chunk) <= settings.chunk_max_lines // 2
     )
+
+
+def write_conspect(
+    path: Path,
+    text: str,
+    cache_key: str,
+    header_title: str,
+    out_suffix: str,
+    out_dir: Path | None = None,
+    progress=None,
+) -> list[Path]:
+    """Записать конспект источника: шапка (название/фрагменты/дата) + текст + футер.
+
+    Единая запись для PDF/презентаций/таблиц — раньше три копии с чуть
+    разными полями шапки. Имя файла: `{stem}_{hash8}{suffix}`.
+    """
+    target_dir = out_dir or settings.results_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    out_path = target_dir / f"{path.stem}_{cache_key[:8]}{out_suffix}"
+    header = _header_block(header_title, [
+        ("Документ", path.name),
+        ("Фрагментов", len(text.split("\n\n")) if text else 0),
+        ("Дата", time.strftime("%d.%m.%Y %H:%M")),
+    ])
+    out_path.write_text(header + text.strip() + "\n\n" + _footer_block("конспекта"), encoding="utf-8")
+    logger.info(f"Конспект готов: {out_path.name}")
+    if progress:
+        progress({"log": f"Конспект готов: {out_path.name}"})
+    return [out_path]

@@ -79,8 +79,9 @@ class TestFilesEndpoint:
 
 
 class TestZipEndpoint:
-    def test_zip_contains_exactly_job_files(self, panel, tmp_path):
+    def test_zip_contains_exactly_job_files(self, panel, tmp_path, monkeypatch):
         wp, jobs = panel
+        monkeypatch.setattr(wp, "ZIPS_DIR", tmp_path / "zips")  # не трогаем output/zips
         report = _make(tmp_path / "report_x.txt", "ОТЧЁТ")
         tr = _make(tmp_path / "v.transcript.txt", "[00:00] текст")
         sm = _make(tmp_path / "book.pdf.txt", "конспект")
@@ -98,9 +99,9 @@ class TestZipEndpoint:
         assert r.mimetype == "application/zip"
         zf = zipfile.ZipFile(io.BytesIO(r.data))
         assert sorted(zf.namelist()) == [
-            "report_x.txt",
-            "summaries/book.pdf.txt",
-            "transcripts/v.transcript.txt",
+            "вторичная обработка/конспекты PDF/book.pdf.txt",
+            "отчёты/report_x.txt",
+            "первичная обработка/транскрипты/v.transcript.txt",
         ]
 
     def test_job_without_files_404(self, panel):
@@ -174,6 +175,59 @@ class TestPhaseStatus:
         assert st["transcribe"]["current"] == "a.mp3"
         assert st["images"]["current"] == "батч 2 из 7 (3 шт.)"
         assert "total" not in st["images"]  # у батча нет счётчика
+
+    def test_batch_counter_lands_in_phase_status(self, panel, monkeypatch):
+        """Счётчик «N из M» батчевых фаз доходит до phase_status и живёт в снимке."""
+        st, _ = self._run_with_events(panel, monkeypatch, [
+            {"phase": "images", "weight": 25},
+            {"p": "images", "phase_progress": 0.5, "done": 1, "total": 2},
+            {"p": "images", "phase_progress": 1.0, "done": 2, "total": 2},
+        ])
+        assert st["images"]["percent"] == 100
+        assert st["images"]["done"] == 2
+        assert st["images"]["total"] == 2
+
+    def test_progress_without_counter_keeps_fields_absent(self, panel, monkeypatch):
+        """Фазы без счётчика (анализ) не получают пустых done/total."""
+        st, _ = self._run_with_events(panel, monkeypatch, [
+            {"p": "analysis", "phase_progress": 0.5},
+        ])
+        assert st["analysis"]["percent"] == 50
+        assert "done" not in st["analysis"] and "total" not in st["analysis"]
+
+    def test_raw_mode_passed_to_pipeline(self, panel, monkeypatch):
+        """mode=raw: в run_pipeline уходят raw=True, process=False."""
+        wp, jobs = panel
+        capture: dict = {}
+
+        def fake_pipeline(paths, **kwargs):
+            capture.update(kwargs)
+            return {"transcripts": [], "report": None, "image_reports": [], "raw_files": []}
+
+        monkeypatch.setattr(wp, "run_pipeline", fake_pipeline)
+        monkeypatch.setattr(wp.socketio, "emit", lambda *a, **k: None)
+        jobs["jr"] = {"state": "queued", "progress": 0, "lines": [], "phase_status": {},
+                      "error": "", "report": None}
+        wp.run_job("jr", ["x"], "raw", False, "small", "auto")
+        assert capture["raw"] is True
+        assert capture["process"] is False
+        assert capture["extract"] is True
+
+    def test_full_mode_raw_false(self, panel, monkeypatch):
+        wp, jobs = panel
+        capture: dict = {}
+
+        def fake_pipeline(paths, **kwargs):
+            capture.update(kwargs)
+            return {"transcripts": [], "report": None, "image_reports": [], "raw_files": []}
+
+        monkeypatch.setattr(wp, "run_pipeline", fake_pipeline)
+        monkeypatch.setattr(wp.socketio, "emit", lambda *a, **k: None)
+        jobs["jf"] = {"state": "queued", "progress": 0, "lines": [], "phase_status": {},
+                      "error": "", "report": None}
+        wp.run_job("jf", ["x"], "full", False, "small", "auto")
+        assert capture["raw"] is False
+        assert capture["process"] is True
 
     def test_phase_done_removes_only_its_label(self, panel, monkeypatch):
         st, _ = self._run_with_events(panel, monkeypatch, [
@@ -251,6 +305,28 @@ class TestRerunMode:
         assert jobs[new_id]["model"] == "medium"
 
 
+class TestStatusEndpoint:
+    def test_status_returns_full_job(self, panel):
+        """JS восстанавливает состояние из /api/status: job целиком, с lines."""
+        wp, jobs = panel
+        jobs["s1"] = {
+            "state": "done", "progress": 100, "lines": ["Готово."],
+            "phase_status": {}, "estimate": "ИТОГО: ~5 мин",
+        }
+        client = wp.app.test_client()
+        r = client.get("/api/status/s1")
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["state"] == "done"
+        assert body["lines"] == ["Готово."]
+        assert body["estimate"] == "ИТОГО: ~5 мин"
+
+    def test_status_unknown_404(self, panel):
+        wp, _ = panel
+        client = wp.app.test_client()
+        assert client.get("/api/status/nope").status_code == 404
+
+
 class TestPageRender:
     def test_index_serves_per_phase_markup(self, panel):
         """Страница содержит контейнер и логику отдельных надписей по фазам."""
@@ -263,6 +339,13 @@ class TestPageRender:
         assert "renderPhases" in body
         assert "phase_status" in body
         assert "fileStatus" not in body  # старая единая надпись удалена
+
+    def test_raw_button_mentions_transcription(self, panel):
+        """Кнопка raw-режима ясно говорит, что транскрибация в него входит."""
+        wp, _ = panel
+        client = wp.app.test_client()
+        body = client.get("/").get_data(as_text=True)
+        assert "Транскрибация + извлечение текста (без NIM)" in body
 
 
 class TestProgressPayload:

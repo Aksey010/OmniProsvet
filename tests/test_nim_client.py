@@ -365,6 +365,93 @@ class TestDocTextBudget:
         assert 'NIM_DOC_TEXT_CHARS", 60_000' in src_text
 
 
+class TestCircuitBreaker:
+    """Сессия 16.10: vision-запросы умирали по 5 ретраев с таймаутами —
+    ~15-17 мин простоя на файл при живой текстовой модели. После серии
+    неудач модель отказывает мгновенно (fast-fail), остальные фазы работают."""
+
+    @staticmethod
+    def _failing_post(monkeypatch, cfg, error_text="Сеть: ReadTimeout: timed out"):
+        def fake_post(self, messages, chosen, log_prefix="NIM"):
+            raise NimError(f"NIM: не удалось получить ответ после 5 попыток. {error_text}")
+
+        monkeypatch.setattr(NimClient, "_post_chat", fake_post)
+        return fake_post
+
+    def test_opens_after_consecutive_failures(self, cfg, monkeypatch):
+        import httpx
+
+        client = NimClient()
+        client._sync_client = None
+
+        def fail_post(path, json=None):
+            return httpx.Response(500, request=httpx.Request("POST", "x"))
+
+        monkeypatch.setattr(client, "_pace", lambda: None)
+        monkeypatch.setattr(nc.time, "sleep", lambda s: None)
+        client._get_sync_client()
+        monkeypatch.setattr(client._sync_client, "post", fail_post)
+
+        # 3 логических запроса (каждый — 5 ретраев) подряд не удались
+        for _ in range(3):
+            with pytest.raises(NimError):
+                client.send_prompt("промпт")
+
+        # 4-й — быстрый отказ БЕЗ обращения к сети
+        posts_before = 0
+
+        def counting_fail(path, json=None):
+            nonlocal posts_before
+            posts_before += 1
+            return httpx.Response(500, request=httpx.Request("POST", "x"))
+
+        monkeypatch.setattr(client._sync_client, "post", counting_fail)
+        with pytest.raises(NimError) as ei:
+            client.send_prompt("промпт")
+        assert "breaker" in str(ei.value).lower() or "паузе" in str(ei.value)
+        assert posts_before == 0, "запрос при открытом breaker не должен уходить в сеть"
+
+    def test_success_resets_breaker(self, cfg, monkeypatch):
+        client = NimClient()
+        fail = self._failing_post(monkeypatch, cfg)
+        for _ in range(2):
+            with pytest.raises(NimError):
+                client.send_prompt("промпт")
+        # успех сбрасывает серию неудач
+        monkeypatch.setattr(NimClient, "_post_chat", lambda self, m, c, p="NIM": ("ок", "stop"))
+        client.send_prompt("промпт")
+        # после сброса снова нужны 3 неудачи, а не одна
+        monkeypatch.setattr(NimClient, "_post_chat", fail)
+        for _ in range(2):
+            with pytest.raises(NimError):
+                client.send_prompt("промпт")
+        with pytest.raises(NimError) as ei:
+            client.send_prompt("промпт")
+        assert "не удалось получить ответ" in str(ei.value), "серия должна была сброситься успехом"
+
+    def test_breaker_is_per_model(self, cfg):
+        """Vision-модель на паузе не должна ломать текстовую (и наоборот)."""
+        client = NimClient()
+        client._breaker_record_failure("test-vision")
+        client._breaker_record_failure("test-vision")
+        client._breaker_record_failure("test-vision")
+        with pytest.raises(NimError, match="паузе"):
+            client._breaker_check("test-vision")
+        # текстовая модель не затронута
+        client._breaker_check("test-model")
+
+    def test_cooldown_progressive_and_capped(self, cfg, monkeypatch):
+        now = [1000.0]
+        monkeypatch.setattr(nc.time, "time", lambda: now[0])
+        client = NimClient()
+        for _ in range(6):
+            client._breaker_record_failure("test-vision")
+        state = client._breaker["test-vision"]
+        assert state["failures"] == 6
+        expected = min(600.0, 90.0 * 2 ** 3)  # 720 -> потолок 600
+        assert state["open_until"] == pytest.approx(1000.0 + expected)
+
+
 class TestImageDownscale:
     """Сессии 13–14.10: тяжёлые фото (мегабайты base64) не успевали за 300 с
     на vision-модели — одиночные файлы гибли после 5 ReadTimeout. Картинки

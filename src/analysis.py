@@ -1,4 +1,3 @@
-import hashlib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,7 +6,7 @@ from pathlib import Path
 from loguru import logger
 
 from src.configuration import settings
-from src.database import get_cached_fragment, save_fragment_cache
+from src.database import get_cached_fragment, record_phase_timing, save_fragment_cache
 from src.nim_client import NimError, client as nim_client
 from src.outputs import plain_text
 from src.prompts import build_map_prompt, build_reduce_prompt
@@ -89,9 +88,6 @@ def _process_fragment(idx: int, total: int, chunk: list[str], source: str, progr
         text = plain_text(
             nim_client.send_prompt(
                 build_map_prompt(idx, total, source, body),
-                deepthink=False,
-                expert=False,
-                stable_rounds=6,
             )
         )
     except NimError as exc:
@@ -141,6 +137,35 @@ def _submit_fragments(
         fut.add_done_callback(tracker.tick)
         futures.append(fut)
     return futures
+
+
+def finalize_conspect(
+    source: str,
+    lines: list[str],
+    phase: str,
+    progress=None,
+    tracker: "_FragProgress | None" = None,
+    submit=None,
+) -> str | None:
+    """Общий MAP-этап конспекта: чанкинг -> пул NIM -> join текстов.
+
+    Используется PDF/презентациями/таблицами (раньше — три копии цикла).
+    Сохранение в кэш и запись файла остаются у вызывающей стороны: у каждого
+    вида консПЕКТА свои кэш-ключи и патчи в тестах. submit — свой процессор
+    фрагментов (таблицы шлют промпт ТАБЛИЦЫ, не ФРАГМЕНТ). Возвращает join
+    конспектов фрагментов или None, если чанков не получилось.
+    """
+    budget = settings.nim_chunk_char_budget
+    chunks = _chunk_lines(lines, budget)
+    if not chunks:
+        return None
+    if tracker is None:
+        tracker = _FragProgress(phase, 1.0, progress)
+    executor = ThreadPoolExecutor(max_workers=min(settings.nim_workers, len(chunks)))
+    futures = (submit or _submit_fragments)(source, chunks, executor, tracker, progress)
+    executor.shutdown(wait=True)
+    texts = [fut.result() for fut in futures]
+    return "\n\n".join(texts)
 
 
 def _plan_fragments(
@@ -208,9 +233,6 @@ def _intermediate_group_summaries(
         return plain_text(
             nim_client.send_prompt(
                 prompt,
-                deepthink=False,
-                expert=False,
-                stable_rounds=6,
             )
         )
 
@@ -258,9 +280,6 @@ def _final_reduce_with_fallback(parts_block: str, n_transcripts: int, total_frag
         return plain_text(
             nim_client.send_prompt(
                 build_reduce_prompt(n_transcripts, total_fragments, parts_block),
-                deepthink=settings.nim_workers > 1,
-                expert=settings.nim_workers > 1,
-                stable_rounds=6,
                 model=settings.nim_reduce_model,
             )
         )
@@ -276,9 +295,6 @@ def _final_reduce_with_fallback(parts_block: str, n_transcripts: int, total_frag
             return plain_text(
                 nim_client.send_prompt(
                     build_reduce_prompt(n_transcripts, total_fragments, parts_block),
-                    deepthink=False,
-                    expert=False,
-                    stable_rounds=6,
                     model=fallback_model,
                 )
             )
@@ -354,6 +370,11 @@ def run_process_only(
     transcripts = sorted(uniq.values(), key=lambda x: x.name)
     if not transcripts:
         logger.warning("Транскрипты не найдены")
+        if progress:
+            # Фаза анализа закрывается с весом: иначе её 75% (process-режим)
+            # никогда не засчитываются, и шкала прогресса не добирает до 100%
+            progress({"phase": "analysis", "weight": weights.get("analysis", 0)})
+            progress({"phase_done": "analysis"})
         return [], None
 
     return _run_analysis_on_transcripts(transcripts, out_dir, weights, progress)
@@ -370,6 +391,9 @@ def run_analysis_on_transcripts(
     transcripts = sorted(uniq.values(), key=lambda x: x.name)
     if not transcripts:
         logger.warning("Транскрипты не найдены")
+        if progress:
+            progress({"phase": "analysis", "weight": weights.get("analysis", 0)})
+            progress({"phase_done": "analysis"})
         return [], None
 
     return _run_analysis_on_transcripts(transcripts, out_dir, weights, progress)
@@ -401,6 +425,7 @@ def _run_analysis_on_transcripts(
     executor = ThreadPoolExecutor(max_workers=settings.nim_workers)
     tracker = _FragProgress("analysis", REDUCE_FRACTION, progress)
     tracker.add_total(total_fragments)
+    phase_started = time.monotonic()
 
     all_futures: list = []
     for source, chunks in units:
@@ -413,6 +438,8 @@ def _run_analysis_on_transcripts(
             progress({"phase_done": "analysis"})
         return transcripts, None
     report = _reduce_and_save(transcripts, all_futures, out_dir, progress)
+    # Статистика скорости фазы (MAP+reduce, стенное время) для оценок времени
+    record_phase_timing("analysis", total_fragments, time.monotonic() - phase_started)
     if progress:
         progress({"phase_done": "analysis"})
     return transcripts, report
